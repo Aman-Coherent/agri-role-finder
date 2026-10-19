@@ -12,6 +12,7 @@ const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 const { loadContentParser, ROOT } = require("./load.js");
+const ARF_STORE = require("../store.js");
 
 const { parseAnswer } = loadContentParser();
 const SEARCH = "https://www.google.com/search?q=";
@@ -23,6 +24,7 @@ async function settle() {
 
 function makeHarness() {
   const store = {};
+  const writes = []; // the keys of each storage write, in order
   const on = { message: null, alarm: null, updated: [], removed: [], startup: [], installed: [] };
   const alarms = new Map();
   const tabs = new Map();
@@ -44,8 +46,11 @@ function makeHarness() {
     storage: {
       local: {
         get: async (k) => (k in store ? { [k]: structuredClone(store[k]) } : {}),
-        set: async (o) => Object.entries(o).forEach(([k, v]) => (store[k] = structuredClone(v))),
-        remove: async (k) => delete store[k],
+        set: async (o) => {
+          writes.push(Object.keys(o));
+          Object.entries(o).forEach(([k, v]) => (store[k] = structuredClone(v)));
+        },
+        remove: async (k) => [].concat(k).forEach((key) => delete store[key]),
       },
     },
     alarms: {
@@ -102,21 +107,26 @@ function makeHarness() {
     setTimeout: unrefTimeout, clearTimeout, URL, URLSearchParams, structuredClone, chrome,
   });
   ctx.globalThis = ctx;
-  ctx.importScripts = (f) => vm.runInContext(fs.readFileSync(path.join(ROOT, f), "utf8"), ctx);
+  ctx.importScripts = (...files) => files.forEach((f) => vm.runInContext(fs.readFileSync(path.join(ROOT, f), "utf8"), ctx));
   vm.runInContext(fs.readFileSync(path.join(ROOT, "background.js"), "utf8"), ctx);
 
   const send = (message, sender = {}) =>
     new Promise((resolve) => on.message(message, { id: "ext", ...sender }, resolve));
   const engine = () => store.arfEngine;
   const project = () => store[Object.keys(store).find((k) => k.startsWith("arfProject_"))];
-  const byName = (name) => project().queue.find((c) => c.company_name === name);
+  // Every company, read back from the stored pieces.
+  const items = () => {
+    const meta = project();
+    return Array.from({ length: meta.chunkCount }, (_, n) => store[ARF_STORE.chunkKey(meta.id, n)] || []).flat();
+  };
+  const byName = (name) => items().find((c) => c.company_name === name);
   const workerTab = () => {
     const w = (engine().workers || [])[0];
     return w && w.tabId != null ? tabs.get(w.tabId) : null;
   };
 
   return {
-    send, engine, project, byName, workerTab, tabs, alarms, activated, navigate, navigations,
+    ctx, store, writes, send, engine, project, items, byName, workerTab, tabs, alarms, activated, navigate, navigations,
     setRedirect(fn) {
       redirect = fn;
     },
@@ -126,12 +136,16 @@ function makeHarness() {
       for (const f of on.updated) f(id, { status: "complete" }, { ...tabs.get(id) });
       await settle();
     },
+    // The way the popup does it: write the pieces, then register them.
     async create(names, opts = {}) {
-      const companies = names.map((n, i) => ({ id: `r${i}`, company_name: n, original: { Company: n } }));
+      const projectId = ARF_STORE.newProjectId();
+      const chunks = ARF_STORE.buildChunks(names.map((n) => ({ company_name: n })));
+      for (const { n, items } of chunks) store[ARF_STORE.chunkKey(projectId, n)] = structuredClone(items);
       const res = await send({
-        type: "CREATE_PROJECT", name: "Test", companies, columns: ["Company"],
+        type: "CREATE_PROJECT", projectId, name: "Test", total: names.length, chunkCount: chunks.length,
         batchSize: opts.batchSize || 3, concurrency: 1, delayMinSec: 2, delayMaxSec: 3,
       });
+      assert.ok(res && res.ok, `project created: ${JSON.stringify(res)}`);
       return res.projectId;
     },
     async start(projectId) {
@@ -224,7 +238,7 @@ test("an explicit NONE answer is final straight away - no retry", async () => {
   await h.start(await h.create(["A", "Ghost", "C"]));
   await h.answer(answers({ none: ["Ghost"] }));
   assert.strictEqual(h.byName("Ghost").status, "not_found");
-  assert.strictEqual(h.byName("Ghost").attempts, undefined);
+  assert.strictEqual(h.byName("Ghost").attempts, 0);
 });
 
 test("Google's CAPTCHA page pauses the run and brings the tab forward; solving it resumes the run", async () => {
@@ -400,7 +414,7 @@ test("closing the worker tab mid-search loses nothing: its companies stay queued
   const first = h.workerTab();
   await h.closeTab(first.id);
   assert.strictEqual(h.byName("A").status, "pending");
-  assert.strictEqual(h.byName("A").attempts, undefined, "not counted as a failed try");
+  assert.strictEqual(h.byName("A").attempts, 0, "not counted as a failed try");
   assert.deepStrictEqual(h.engine().workers[0].currentItemIds, []);
   assert.strictEqual(h.alarms.has("arf-watchdog-0"), false);
   await h.nextBatch();
@@ -444,7 +458,7 @@ test("several searches in a row with no answer at all pause the run instead of w
   assert.strictEqual(h.engine().pauseKind, "empty_streak");
   assert.match(h.engine().pauseReason, /No answers came back for 4 searches in a row/);
   const counts = { pending: 0, not_found: 0 };
-  for (const c of h.project().queue) counts[c.status]++;
+  for (const c of h.items()) counts[c.status]++;
   assert.ok(counts.pending >= 6, "most companies are still waiting, not written off");
 
   await h.send({ type: "RESUME" });
@@ -503,4 +517,88 @@ test("a late answer from a batch the worker already gave up on is ignored", asyn
   }, sender);
   await settle();
   assert.strictEqual(h.byName("A").status, "pending", "the stale report did not overwrite anything");
+});
+
+// --- Big projects: stored in pieces ---
+
+test("a 50,000-company project is created from pieces with a tiny message, and a batch rewrites only its own piece", async () => {
+  const h = makeHarness();
+  const names = Array.from({ length: 50735 }, (_, i) => `Company ${i}`);
+  const pid = await h.create(names);
+  const meta = h.project();
+  assert.strictEqual(meta.total, 50735);
+  assert.strictEqual(meta.chunkCount, 102);
+  assert.strictEqual(meta.counts.pending, 50735);
+  assert.ok(JSON.stringify(meta).length < 50000, "the project summary the popup polls stays small");
+
+  await h.start(pid);
+  h.writes.length = 0;
+  assert.deepStrictEqual(await h.answer(answers()), ["Company 0", "Company 1", "Company 2"]);
+  const chunkWrites = h.writes.flat().filter((k) => k.startsWith("arfChunk_"));
+  assert.deepStrictEqual(chunkWrites, [ARF_STORE.chunkKey(pid, 0)], "one piece rewritten, not the whole project");
+  assert.strictEqual(h.project().counts.found, 3);
+  assert.strictEqual(h.project().counts.pending, 50732);
+});
+
+test("claiming skips pieces with nothing pending and carries on in the next one", async () => {
+  const h = makeHarness();
+  const pid = await h.create(Array.from({ length: 1001 }, (_, i) => `C${i}`));
+  // Pretend the first two pieces (1,000 companies) are already done.
+  for (const n of [0, 1]) {
+    const key = ARF_STORE.chunkKey(pid, n);
+    h.store[key] = h.store[key].map((it) => ({ ...it, status: "found" }));
+  }
+  const meta = h.project();
+  meta.chunkCounts[0] = { pending: 0, found: 500, blocked: 0, not_found: 0 };
+  meta.chunkCounts[1] = { pending: 0, found: 500, blocked: 0, not_found: 0 };
+  await h.start(pid);
+  assert.deepStrictEqual(await h.answer(answers()), ["C1000"]);
+});
+
+test("a half-finished import (a missing piece) is refused instead of becoming a project with companies missing", async () => {
+  const h = makeHarness();
+  const projectId = ARF_STORE.newProjectId();
+  const chunks = ARF_STORE.buildChunks(Array.from({ length: 1200 }, (_, i) => ({ company_name: `C${i}` })));
+  for (const { n, items } of chunks) if (n !== 1) h.store[ARF_STORE.chunkKey(projectId, n)] = items;
+  const res = await h.send({ type: "CREATE_PROJECT", projectId, name: "X", total: 1200, chunkCount: 3 });
+  assert.strictEqual(res.ok, false);
+  assert.match(res.error, /incomplete \(part 2 of 3 is missing\)/);
+  assert.strictEqual(h.project(), undefined);
+
+  const bad = await h.send({ type: "CREATE_PROJECT", projectId: "../evil", name: "X", total: 1, chunkCount: 1 });
+  assert.strictEqual(bad.ok, false);
+});
+
+test("two answers saved at the same moment into the same piece both survive", async () => {
+  const h = makeHarness();
+  const pid = await h.create(["A", "B", "C", "D"]);
+  const setStatus = (id, status) => h.ctx.updateItems(pid, [id], (byId) => {
+    byId.get(id).status = status;
+  });
+  await Promise.all([setStatus("r0", "found"), setStatus("r1", "not_found")]);
+  assert.strictEqual(h.byName("A").status, "found");
+  assert.strictEqual(h.byName("B").status, "not_found");
+  assert.deepStrictEqual(h.project().counts, { pending: 2, found: 1, blocked: 0, not_found: 1 });
+});
+
+test("Delete removes every piece of the project", async () => {
+  const h = makeHarness();
+  const pid = await h.create(Array.from({ length: 1200 }, (_, i) => `C${i}`));
+  await h.send({ type: "DELETE_PROJECT", projectId: pid });
+  await settle();
+  assert.deepStrictEqual(Object.keys(h.store).filter((k) => k.includes(pid)), []);
+});
+
+test("Retry not-found rows only touches the pieces that hold not-found companies", async () => {
+  const h = makeHarness();
+  const pid = await h.create(Array.from({ length: 1200 }, (_, i) => `C${i}`));
+  const key = ARF_STORE.chunkKey(pid, 2);
+  h.store[key] = h.store[key].map((it, i) => (i < 5 ? { ...it, status: "not_found", attempts: 2 } : it));
+  h.project().chunkCounts[2] = ARF_STORE.countsOfItems(h.store[key]);
+  h.writes.length = 0;
+  const res = await h.send({ type: "RETRY_NOT_FOUND", projectId: pid });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(res)), { ok: true, count: 5 });
+  assert.deepStrictEqual(h.writes.flat().filter((k) => k.startsWith("arfChunk_")), [key]);
+  assert.strictEqual(h.byName("C1000").status, "pending");
+  assert.strictEqual(h.byName("C1000").attempts, 0);
 });

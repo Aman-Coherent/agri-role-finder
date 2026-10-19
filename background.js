@@ -37,11 +37,9 @@
  *   arfProjectIndex        -> { [id]: { name, createdAt, total, counts } }
  *                              lightweight, always small - safe to read on
  *                              every poll for the project list.
- *   arfProject_<id>         -> full project record (including its queue and
- *                              the input file's column order) -
- *                              read/written per-project, not all at once,
- *                              so one large project doesn't make every
- *                              write touch every other project's data too.
+ *   arfProject_<id>         -> a project's meta (settings, counts) - its
+ *   arfChunk_<id>_<n>          companies live in pieces of 500 alongside it;
+ *                              see store.js for the layout and why.
  *   arfEngine               -> the single shared run-state: which project
  *                              is active, running/paused, and one entry
  *                              per worker (its tab + claimed item IDs).
@@ -60,10 +58,9 @@
  *   per-project setting, not silently maximized here.
  */
 
-importScripts("taxonomy.js"); // defines globalThis.ARF_TAXONOMY
+importScripts("taxonomy.js", "store.js"); // define globalThis.ARF_TAXONOMY and ARF_STORE
 
 const PROJECT_INDEX_KEY = "arfProjectIndex";
-const PROJECT_KEY_PREFIX = "arfProject_";
 const ENGINE_KEY = "arfEngine";
 
 const ALARM_PREFIX = "arf-next-";
@@ -206,14 +203,6 @@ function debug(...args) {
   if (DEBUG) console.log("[AgriRoleFinder]", ...args);
 }
 
-function projectKey(id) {
-  return PROJECT_KEY_PREFIX + id;
-}
-
-function newProjectId() {
-  return `proj_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
 function newBatchToken() {
   return `b_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -228,57 +217,15 @@ function clampBatchSize(n) {
   return Math.max(MIN_BATCH_SIZE, Math.min(v, MAX_BATCH_SIZE));
 }
 
-function countsOf(queue) {
-  const counts = { pending: 0, found: 0, blocked: 0, not_found: 0 };
-  for (const c of queue) counts[c.status] = (counts[c.status] || 0) + 1;
-  return counts;
-}
-
-function makeProject(name, companies, columns, delayMinSec, delayMaxSec, concurrency, batchSize) {
-  return {
-    id: newProjectId(),
-    name: String(name || "Untitled project").trim().slice(0, 120) || "Untitled project",
-    createdAt: Date.now(),
-    // The input file's own header row, in its own order. Every export starts
-    // with exactly these columns (from each item's `original`), so results
-    // line up with the file the user uploaded.
-    columns: Array.isArray(columns) ? columns.map(String) : [],
-    queue: companies.map((c) => ({
-      id: String(c.id),
-      native_id: c.native_id || "",
-      company_name: c.company_name,
-      website: c.website || "",
-      city: c.city || "",
-      state: c.state || "",
-      country: c.country || "",
-      // A single combined address column, used only when the file has no
-      // separate city/state/country columns.
-      location: c.location || "",
-      // Every cell of the input row, keyed by its header, carried through to
-      // the exports untouched.
-      original: c.original && typeof c.original === "object" ? c.original : {},
-      status: "pending",
-      description: null,
-      // [{ entity, entityInList, roles: [{ name, code, inList, types }] }] -
-      // see ARF_TAXONOMY.classify in taxonomy.js.
-      classifications: [],
-    })),
-    delayMinSec: delayMinSec || 8,
-    delayMaxSec: delayMaxSec || 15,
-    // How many tabs run this project's queue at once. More = faster, but
-    // more simultaneous traffic from one IP = higher block risk - a
-    // deliberate per-project trade-off, not maximized by default.
-    concurrency: clampConcurrency(concurrency),
-    // How many companies get bundled into one AI Mode search. More = fewer
-    // total searches (faster, lower block risk) but a longer, harder-for-
-    // the-AI-to-fully-comply-with query - see the file-level comment.
-    batchSize: clampBatchSize(batchSize),
-    completionLog: [],
-  };
-}
-
 // ---------------------------------------------------------------------------
-// Storage helpers
+// Project storage - in pieces of ARF_STORE.CHUNK_SIZE companies; see store.js
+// for the layout and why.
+//
+// Every read-modify-write of project data goes through withDataLock, the
+// same chaining pattern as the engine lock below. Without it, two tabs whose
+// answers arrive at the same moment could each read a piece, add their own
+// results, and write it back - and the second write would silently erase the
+// first tab's results.
 // ---------------------------------------------------------------------------
 
 async function getProjectIndex() {
@@ -290,25 +237,253 @@ async function saveProjectIndex(index) {
   await chrome.storage.local.set({ [PROJECT_INDEX_KEY]: index });
 }
 
-async function getProject(id) {
-  if (!id) return null;
-  const data = await chrome.storage.local.get(projectKey(id));
-  return data[projectKey(id)] || null;
+// A project's meta (no companies - see readChunk). Records in the old
+// single-record layout are converted by migrateLegacyProjects, never read
+// here.
+async function getMeta(pid) {
+  if (!pid) return null;
+  const key = ARF_STORE.metaKey(pid);
+  const data = await chrome.storage.local.get(key);
+  const meta = data[key];
+  return meta && !meta.queue ? meta : null;
 }
 
-async function saveProject(project) {
-  await chrome.storage.local.set({ [projectKey(project.id)]: project });
+async function readChunk(pid, n) {
+  const key = ARF_STORE.chunkKey(pid, n);
+  const data = await chrome.storage.local.get(key);
+  return data[key] || [];
 }
 
-async function deleteProjectStorage(id) {
-  await chrome.storage.local.remove(projectKey(id));
+let dataLock = Promise.resolve();
+
+function withDataLock(fn) {
+  const result = dataLock.then(fn, fn);
+  dataLock = result.then(
+    () => {},
+    () => {}
+  );
+  return result;
 }
 
-async function updateIndexCounts(project) {
+async function updateIndexCounts(meta) {
   const index = await getProjectIndex();
-  if (!index[project.id]) return;
-  index[project.id] = { ...index[project.id], total: project.queue.length, counts: countsOf(project.queue) };
+  if (!index[meta.id]) return;
+  index[meta.id] = { ...index[meta.id], total: meta.total, counts: meta.counts };
   await saveProjectIndex(index);
+}
+
+// Writes the changed pieces and the meta (whose counts are recomputed from
+// those pieces) in ONE storage call, so counts and companies can't drift
+// apart. Must be called inside withDataLock.
+async function commitChunks(meta, chunks, logCompletion) {
+  const entries = {};
+  const chunkCounts = meta.chunkCounts.slice();
+  for (const [n, items] of chunks) {
+    entries[ARF_STORE.chunkKey(meta.id, n)] = items;
+    chunkCounts[n] = ARF_STORE.countsOfItems(items);
+  }
+  const next = {
+    ...meta,
+    chunkCounts,
+    counts: ARF_STORE.sumCounts(chunkCounts),
+    completionLog: logCompletion
+      ? [...(meta.completionLog || []), Date.now()].slice(-COMPLETION_LOG_SIZE)
+      : meta.completionLog || [],
+  };
+  entries[ARF_STORE.metaKey(meta.id)] = next;
+  await chrome.storage.local.set(entries);
+  await updateIndexCounts(next);
+  return next;
+}
+
+// Read-modify-write of specific companies. Only the pieces they live in are
+// read and rewritten. `mutate(byId, meta)` changes items in place and may
+// return { logCompletion: true } to count this as a finished batch for the
+// rate/ETA. Resolves to the updated meta (null if the project is gone).
+function updateItems(pid, ids, mutate) {
+  return withDataLock(async () => {
+    const meta = await getMeta(pid);
+    if (!meta) return null;
+    const chunks = new Map();
+    const byId = new Map();
+    for (const n of new Set(ids.map(ARF_STORE.chunkOfId))) {
+      if (n < 0 || n >= meta.chunkCount) continue;
+      const items = await readChunk(pid, n);
+      chunks.set(n, items);
+      for (const it of items) byId.set(it.id, it);
+    }
+    const outcome = (await mutate(byId, meta)) || {};
+    return chunks.size ? commitChunks(meta, chunks, !!outcome.logCompletion) : meta;
+  });
+}
+
+// The same for every company with a given status ("Retry not-found rows",
+// Resume re-queueing blocked ones). The per-piece counts mean only pieces
+// that actually hold such a company are read.
+function updateItemsWithStatus(pid, status, mutate) {
+  return withDataLock(async () => {
+    const meta = await getMeta(pid);
+    if (!meta) return { meta: null, count: 0 };
+    const chunks = new Map();
+    let count = 0;
+    for (let n = 0; n < meta.chunkCount; n++) {
+      if (!meta.chunkCounts[n] || !meta.chunkCounts[n][status]) continue;
+      const items = await readChunk(pid, n);
+      for (const it of items) {
+        if (it.status !== status) continue;
+        mutate(it);
+        count++;
+      }
+      chunks.set(n, items);
+    }
+    return { meta: chunks.size ? await commitChunks(meta, chunks, false) : meta, count };
+  });
+}
+
+// Settings and other changes to the meta alone.
+function updateMeta(pid, mutate) {
+  return withDataLock(async () => {
+    const meta = await getMeta(pid);
+    if (!meta) return null;
+    mutate(meta);
+    await chrome.storage.local.set({ [ARF_STORE.metaKey(pid)]: meta });
+    return meta;
+  });
+}
+
+// Up to `limit` pending companies that no worker is already searching, in
+// file order. Pieces with nothing pending are skipped on their counts alone,
+// so a nearly finished 50,000-company project doesn't read every piece to
+// find the last few.
+async function findPending(meta, excludeIds, limit) {
+  const picked = [];
+  for (let n = 0; n < meta.chunkCount && picked.length < limit; n++) {
+    if (!meta.chunkCounts[n] || !meta.chunkCounts[n].pending) continue;
+    for (const it of await readChunk(meta.id, n)) {
+      if (it.status !== "pending" || excludeIds.has(it.id)) continue;
+      picked.push(it);
+      if (picked.length >= limit) break;
+    }
+  }
+  return picked;
+}
+
+// Registers a project whose pieces the popup has already written (see
+// createProject in popup.js - the company list itself is far too big to send
+// in a message). Every piece is read back once to check it is really there
+// and to count it, so a half-finished import can never become a project with
+// companies silently missing.
+function createProjectFromChunks(message) {
+  return withDataLock(async () => {
+    const pid = String(message.projectId || "");
+    const total = Number(message.total);
+    const chunkCount = Number(message.chunkCount);
+    if (!ARF_STORE.PROJECT_ID_RE.test(pid)) return { ok: false, error: "Invalid project id." };
+    if (!message.name || !Number.isInteger(total) || total < 1) {
+      return { ok: false, error: "A project name and at least one company are required." };
+    }
+    if (chunkCount !== Math.ceil(total / ARF_STORE.CHUNK_SIZE)) return { ok: false, error: "The import is incomplete." };
+    const index = await getProjectIndex();
+    if (index[pid]) return { ok: false, error: "That project already exists." };
+
+    const chunkCounts = [];
+    for (let n = 0; n < chunkCount; n++) {
+      const items = await readChunk(pid, n);
+      if (!items.length) return { ok: false, error: `The import is incomplete (part ${n + 1} of ${chunkCount} is missing).` };
+      chunkCounts.push(ARF_STORE.countsOfItems(items));
+    }
+    const counts = ARF_STORE.sumCounts(chunkCounts);
+    const stored = ARF_STORE.STATUSES.reduce((s, k) => s + counts[k], 0);
+    if (stored !== total) return { ok: false, error: `The import is incomplete (${stored} of ${total} companies saved).` };
+
+    const detected = {};
+    for (const [field, header] of Object.entries(message.detected || {})) {
+      if (typeof header === "string") detected[field] = header.slice(0, 200);
+    }
+    const meta = {
+      id: pid,
+      name: String(message.name).trim().slice(0, 120) || "Untitled project",
+      createdAt: Date.now(),
+      // Which input header each field was read from - shown in the popup so
+      // a wrong auto-detection is visible before a long run, not after.
+      detected,
+      total,
+      chunkCount,
+      chunkCounts,
+      counts,
+      delayMinSec: Number(message.delayMinSec) || 8,
+      delayMaxSec: Number(message.delayMaxSec) || 15,
+      // How many tabs run this project's queue at once. More = faster, but
+      // more simultaneous traffic from one IP = higher block risk.
+      concurrency: clampConcurrency(message.concurrency),
+      // How many companies go into one search - see the file-level comment.
+      batchSize: clampBatchSize(message.batchSize),
+      completionLog: [],
+    };
+    await chrome.storage.local.set({ [ARF_STORE.metaKey(pid)]: meta });
+    index[pid] = { name: meta.name, createdAt: meta.createdAt, total, counts };
+    await saveProjectIndex(index);
+    return { ok: true, projectId: pid };
+  });
+}
+
+function projectDataKeys(pid, chunkCount) {
+  const keys = [ARF_STORE.metaKey(pid)];
+  for (let n = 0; n < chunkCount; n++) keys.push(ARF_STORE.chunkKey(pid, n));
+  return keys;
+}
+
+// Leftovers of an import that never finished (the popup was closed half-way
+// through writing pieces) belong to no project. chrome.storage.local.getKeys
+// lists keys without loading their values; on a Chrome too old to have it,
+// this simply does nothing.
+async function cleanupOrphanData() {
+  if (typeof chrome.storage.local.getKeys !== "function") return;
+  const index = await getProjectIndex();
+  const keys = await chrome.storage.local.getKeys();
+  const orphans = keys.filter((k) => {
+    const m = k.match(/^arf(?:Project|Chunk)_(proj_[a-z0-9]+_[a-z0-9]+)/);
+    return m && !index[m[1]];
+  });
+  if (orphans.length) {
+    await chrome.storage.local.remove(orphans);
+    debug(`removed ${orphans.length} piece(s) left over from unfinished imports`);
+  }
+}
+
+// Projects saved by the first version of this extension were one record with
+// the whole queue inside. Converted once, in place, keeping every result.
+async function migrateLegacyProjects() {
+  const index = await getProjectIndex();
+  for (const pid of Object.keys(index)) {
+    const key = ARF_STORE.metaKey(pid);
+    const legacy = (await chrome.storage.local.get(key))[key];
+    if (!legacy || !Array.isArray(legacy.queue)) continue;
+    const queue = legacy.queue;
+    const chunks = ARF_STORE.buildChunks(queue);
+    const entries = {};
+    const chunkCounts = [];
+    for (const { n, items } of chunks) {
+      items.forEach((it, i) => {
+        const old = queue[n * ARF_STORE.CHUNK_SIZE + i];
+        Object.assign(it, {
+          status: old.status === "pending" || ARF_STORE.STATUSES.includes(old.status) ? old.status : "pending",
+          attempts: old.attempts || 0,
+          description: old.description || null,
+          classifications: old.classifications || [],
+        });
+      });
+      entries[ARF_STORE.chunkKey(pid, n)] = items;
+      chunkCounts.push(ARF_STORE.countsOfItems(items));
+    }
+    const { queue: _dropped, columns: _cols, ...rest } = legacy;
+    const counts = ARF_STORE.sumCounts(chunkCounts);
+    entries[key] = { ...rest, total: queue.length, chunkCount: chunks.length, chunkCounts, counts };
+    await chrome.storage.local.set(entries);
+    index[pid] = { ...index[pid], total: queue.length, counts };
+    await saveProjectIndex(index);
+    debug(`converted project ${pid} to the piece-by-piece layout`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -582,30 +757,25 @@ function sanitizeResultEntry(entry) {
 // A raw pending count gets silently truncated by Chrome's small badge area
 // and isn't very informative anyway. A percentage always fits, and color
 // makes "is this actually running" visible without opening the popup.
-function updateBadge(engine, project) {
-  const total = project ? project.queue.length : 0;
+function updateBadge(engine, meta) {
+  const total = meta ? meta.total : 0;
   if (!total || (!engine.isRunning && !engine.isPaused)) {
     chrome.action.setBadgeText({ text: "" });
     return;
   }
-  const done = total - project.queue.filter((c) => c.status === "pending").length;
+  const done = total - ((meta.counts && meta.counts.pending) || 0);
   chrome.action.setBadgeText({ text: `${Math.round((done / total) * 100)}%` });
   chrome.action.setBadgeBackgroundColor({ color: engine.isPaused ? "#f9a825" : "#0a8043" });
 }
 
 // Builds the pause banner text shown while one or more tabs are sitting on
-// an unsolved CAPTCHA. `engine` supplies the tabId -> worker -> items
-// lookup; `project` is always the single currently-active project. A
-// captcha'd tab may have several companies in flight (a whole batch), all
-// named here.
-function buildCaptchaPauseReason(captchaTabIds, engine, project) {
+// an unsolved CAPTCHA. A captcha'd tab may have several companies in flight
+// (a whole batch), all named here - from the names each worker keeps for its
+// batch (currentNames), so this needs no project read.
+function buildCaptchaPauseReason(captchaTabIds, engine) {
   const names = captchaTabIds.flatMap((tabId) => {
     const worker = engine.workers.find((w) => w.tabId === tabId);
-    if (!worker) return [];
-    return (worker.currentItemIds || [])
-      .map((id) => project.queue.find((c) => c.id === id))
-      .filter(Boolean)
-      .map((item) => item.company_name);
+    return worker ? worker.currentNames || [] : [];
   });
   const who = names.length ? names.join(", ") : "a company";
   const kinds = captchaTabIds.map((id) => (engine.humanKinds || {})[id] || "captcha");
@@ -792,7 +962,7 @@ async function processNext(workerIndex) {
   if (!snapshot.isRunning || snapshot.isPaused || !snapshot.activeProjectId) return;
   if (!snapshot.workers[workerIndex] || (snapshot.workers[workerIndex].currentItemIds || []).length) return;
 
-  const project = await getProject(snapshot.activeProjectId);
+  const project = await getMeta(snapshot.activeProjectId);
   if (!project) {
     await mutateEngine(() => ({ isRunning: false, isPaused: false, activeProjectId: null, workers: [] }));
     chrome.action.setBadgeText({ text: "" });
@@ -813,22 +983,27 @@ async function processNext(workerIndex) {
     // taken above. With several workers running, another one can finish a
     // batch and save its results in between - and against the stale snapshot
     // those companies still look "pending", so this worker would re-claim
-    // and re-search work that is already done. Harmless to the data, pure
-    // waste of the run's throughput, and it grows with the worker count.
-    const fresh = (await getProject(engine.activeProjectId)) || project;
-    const inFlightIds = new Set(engine.workers.flatMap((w) => w.currentItemIds || []));
-    const pending = fresh.queue.filter((c) => c.status === "pending" && !inFlightIds.has(c.id));
-    if (!pending.length) return {};
+    // and re-search work that is already done. (A batch's results are saved
+    // BEFORE its worker is freed - see handleResult - so a company is always
+    // either still in flight here or already saved, never neither.)
+    //
     // Everything is claimed in batches of project.batchSize. A company a
     // batch answer doesn't cover goes back in the queue once (joining a
     // later batch - see settleUnanswered) rather than being pulled out for a
     // slow one-at-a-time search.
-    claimed = pending.slice(0, project.batchSize || DEFAULT_BATCH_SIZE);
+    const fresh = (await getMeta(engine.activeProjectId)) || project;
+    const inFlightIds = new Set(engine.workers.flatMap((w) => w.currentItemIds || []));
+    const pending = await findPending(fresh, inFlightIds, project.batchSize || DEFAULT_BATCH_SIZE);
+    if (!pending.length) return {};
+    claimed = pending;
     searchUrl = buildSearchUrl(claimed);
     const workers = engine.workers.slice();
     workers[workerIndex] = {
       ...workers[workerIndex],
       currentItemIds: claimed.map((c) => c.id),
+      // Shown in the popup and the CAPTCHA message without reading the
+      // project's pieces every few seconds.
+      currentNames: claimed.map((c) => c.company_name),
       batchToken: newBatchToken(),
       searchUrl,
       renavigations: 0,
@@ -959,26 +1134,24 @@ async function handleWatchdogTimeout(workerIndex) {
     }
   }
 
-  const project = await getProject(engine.activeProjectId);
-  if (!project) return;
   let sampleCompanyName = null;
-  for (const id of stuckItemIds) {
-    const item = project.queue.find((c) => c.id === id);
-    if (!item || item.status !== "pending") continue; // already resolved normally
-    sampleCompanyName = sampleCompanyName || item.company_name;
-    if (isHumanStall) item.status = "blocked";
-    else settleUnanswered(item);
-  }
+  const project = await updateItems(engine.activeProjectId, stuckItemIds, (byId) => {
+    for (const id of stuckItemIds) {
+      const item = byId.get(id);
+      if (!item || item.status !== "pending") continue; // already resolved normally
+      sampleCompanyName = sampleCompanyName || item.company_name;
+      if (isHumanStall) item.status = "blocked";
+      else settleUnanswered(item);
+    }
+    return { logCompletion: true };
+  });
+  if (!project) return;
 
   console.warn(
     `[AgriRoleFinder] watchdog fired for worker ${workerIndex} - ` +
       `${stuckItemIds.length} company(ies) ${isHumanStall ? "marked blocked (CAPTCHA not solved in time)" : "got no answer this time"}` +
       (sampleCompanyName ? ` (e.g. "${sampleCompanyName}")` : "")
   );
-
-  project.completionLog = [...(project.completionLog || []), Date.now()].slice(-COMPLETION_LOG_SIZE);
-  await saveProject(project);
-  await updateIndexCounts(project);
 
   // The worker is always freed - even if every one of its companies turned
   // out to be resolved already - or it would sit "busy" forever.
@@ -994,7 +1167,7 @@ async function handleWatchdogTimeout(workerIndex) {
     delete humanKinds[worker.tabId];
     const pauseReason =
       captchaTabIds.length > 0
-        ? buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds }, project)
+        ? buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds })
         : `Gave up waiting for a CAPTCHA to be solved (no response after ` +
           `${Math.round(CAPTCHA_WATCHDOG_MS / 60000)} min)` +
           (sampleCompanyName ? ` on "${sampleCompanyName}"` : "") +
@@ -1027,7 +1200,7 @@ async function markNeedsHuman(workerIndex, tabId, kind) {
   const worker = engine.workers[workerIndex];
   if (!engine.activeProjectId || !worker || !(worker.currentItemIds || []).length) return;
   if (engine.captchaTabIds.includes(tabId)) return; // already flagged - e.g. re-detected after a failed solve attempt
-  const project = await getProject(engine.activeProjectId);
+  const project = await getMeta(engine.activeProjectId);
   if (!project) return;
 
   armWatchdog(workerIndex, CAPTCHA_WATCHDOG_MS);
@@ -1038,7 +1211,7 @@ async function markNeedsHuman(workerIndex, tabId, kind) {
     return {
       isPaused: true,
       pauseKind: "captcha",
-      pauseReason: buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds }, project),
+      pauseReason: buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds }),
       captchaTabIds,
       humanKinds,
     };
@@ -1067,7 +1240,7 @@ async function handleHumanCleared(workerIndex, tabId) {
   const engine = await getEngine();
   const worker = engine.workers[workerIndex];
   if (!worker || !(worker.currentItemIds || []).length) return;
-  const project = await getProject(engine.activeProjectId);
+  const project = await getMeta(engine.activeProjectId);
   if (!project) return;
 
   armWatchdog(workerIndex, computeWatchdogMs(worker.currentItemIds.length));
@@ -1084,7 +1257,7 @@ async function handleHumanCleared(workerIndex, tabId) {
     return {
       captchaTabIds,
       humanKinds,
-      ...(captchaTabIds.length ? { pauseReason: buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds }, project) } : {}),
+      ...(captchaTabIds.length ? { pauseReason: buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds }) } : {}),
     };
   });
   updateBadge(newEngine, project);
@@ -1264,43 +1437,40 @@ async function handleResult(rawMessage, tabId) {
     }))
   );
 
-  const project = await getProject(engine.activeProjectId);
-  if (!project) return;
-
   const claimedIds = new Set(worker.currentItemIds);
   let anyResolved = false;
   let anyAnswered = false;
   let anyBlocked = false;
-  for (const raw of rawMessage.results) {
-    if (!raw || !claimedIds.has(raw.itemId)) continue; // not part of this worker's claimed batch - ignore
-    const entry = sanitizeResultEntry(raw);
-    if (!entry) continue; // malformed/failed re-validation - drop just this entry
-    const item = project.queue.find((c) => c.id === entry.itemId);
-    if (!item || item.status !== "pending") continue;
-    anyResolved = true;
+  // Saved before the worker is freed below, so processNext can never see
+  // these companies as both "not in flight" and "still pending".
+  const project = await updateItems(engine.activeProjectId, worker.currentItemIds, (byId) => {
+    for (const raw of rawMessage.results) {
+      if (!raw || !claimedIds.has(raw.itemId)) continue; // not part of this worker's claimed batch - ignore
+      const entry = sanitizeResultEntry(raw);
+      if (!entry) continue; // malformed/failed re-validation - drop just this entry
+      const item = byId.get(entry.itemId);
+      if (!item || item.status !== "pending") continue;
+      anyResolved = true;
 
-    if (entry.status === "missing") {
-      settleUnanswered(item);
-      continue;
+      if (entry.status === "missing") {
+        settleUnanswered(item);
+        continue;
+      }
+      item.status = entry.status; // "found" | "not_found" | "blocked"
+      if (entry.status === "blocked") {
+        anyBlocked = true;
+        continue; // nothing was read - keep whatever an earlier pass found
+      }
+      anyAnswered = true;
+      // Never overwrite something with nothing: a "Retry not-found rows" pass
+      // that comes back emptier than the first must not blank out a
+      // description the first pass did get.
+      item.description = entry.description || item.description || null;
+      if (entry.status === "found") item.classifications = entry.classifications;
     }
-    item.status = entry.status; // "found" | "not_found" | "blocked"
-    if (entry.status === "blocked") {
-      anyBlocked = true;
-      continue; // nothing was read - keep whatever an earlier pass found
-    }
-    anyAnswered = true;
-    // Never overwrite something with nothing: a "Retry not-found rows" pass
-    // that comes back emptier than the first must not blank out a
-    // description the first pass did get.
-    item.description = entry.description || item.description || null;
-    if (entry.status === "found") item.classifications = entry.classifications;
-  }
-
-  if (anyResolved) {
-    project.completionLog = [...(project.completionLog || []), Date.now()].slice(-COMPLETION_LOG_SIZE);
-    await saveProject(project);
-    await updateIndexCounts(project);
-  }
+    return { logCompletion: anyResolved };
+  });
+  if (!project) return;
 
   const claimedBatchToken = worker.batchToken;
   // Any real result at all means this tab made it past whatever CAPTCHA it
@@ -1332,7 +1502,7 @@ async function handleResult(rawMessage, tabId) {
       ...(resolvingLastCaptcha
         ? { isPaused: false, pauseKind: null, pauseReason: null }
         : captchaTabIds.length > 0
-        ? { pauseReason: buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds }, project) }
+        ? { pauseReason: buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds }) }
         : {}),
     };
   });
@@ -1378,14 +1548,17 @@ async function resetAfterRestart(reason, closeOldTabs) {
   // only closed when Chrome itself did NOT restart (an extension reload) -
   // after a restart they could belong to tabs of yours.
   if (closeOldTabs) await closeWorkerSurfaces(before.workers);
-  updateBadge(after, await getProject(after.activeProjectId));
+  updateBadge(after, await getMeta(after.activeProjectId));
 }
 
 chrome.runtime.onStartup.addListener(() => {
+  cleanupOrphanData();
   resetAfterRestart("Chrome was restarted while this project was running. Click Resume to continue where it left off.", false);
 });
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener(async () => {
+  await migrateLegacyProjects();
+  cleanupOrphanData();
   resetAfterRestart("The extension was reloaded or updated while this project was running. Click Resume to continue where it left off.", true);
 });
 
@@ -1448,10 +1621,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse(null);
           return;
         }
-        const project = await getProject(engine.activeProjectId);
-        const items = project
-          ? worker.currentItemIds.map((id) => project.queue.find((c) => c.id === id)).filter(Boolean)
-          : [];
+        const names = worker.currentNames || [];
+        const items = worker.currentItemIds.map((id, i) => ({ id, company_name: names[i] || "" }));
         debug(
           `GET_CURRENT -> worker ${workerIndex} (tab ${sender.tab.id}) handed ${items.length} company(ies) - ` +
             `content script is running on that page`
@@ -1495,30 +1666,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
       case "CREATE_PROJECT": {
-        if (!message.name || !Array.isArray(message.companies) || !message.companies.length) {
-          sendResponse({ ok: false, error: "A project name and at least one company are required." });
-          return;
-        }
-        const project = makeProject(
-          message.name, message.companies, message.columns, message.delayMinSec, message.delayMaxSec,
-          message.concurrency, message.batchSize
-        );
-        // Which input header each field was read from - shown in the popup so
-        // a wrong auto-detection is visible before a long run, not after.
-        project.detected = {};
-        for (const [field, header] of Object.entries(message.detected || {})) {
-          if (typeof header === "string") project.detected[field] = header.slice(0, 200);
-        }
-        await saveProject(project);
-        const index = await getProjectIndex();
-        index[project.id] = {
-          name: project.name,
-          createdAt: project.createdAt,
-          total: project.queue.length,
-          counts: countsOf(project.queue),
-        };
-        await saveProjectIndex(index);
-        sendResponse({ ok: true, projectId: project.id });
+        sendResponse(await createProjectFromChunks(message));
         return;
       }
       case "UPDATE_PROJECT_SETTINGS": {
@@ -1533,17 +1681,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: false, error: "Stop this project before changing its settings." });
           return;
         }
-        const project = await getProject(message.projectId);
-        if (!project) {
-          sendResponse({ ok: false, error: "Project not found." });
-          return;
-        }
-        project.delayMinSec = message.delayMinSec || project.delayMinSec;
-        project.delayMaxSec = message.delayMaxSec || project.delayMaxSec;
-        project.concurrency = clampConcurrency(message.concurrency || project.concurrency);
-        project.batchSize = clampBatchSize(message.batchSize || project.batchSize);
-        await saveProject(project);
-        sendResponse({ ok: true });
+        const updated = await updateMeta(message.projectId, (project) => {
+          project.delayMinSec = message.delayMinSec || project.delayMinSec;
+          project.delayMaxSec = message.delayMaxSec || project.delayMaxSec;
+          project.concurrency = clampConcurrency(message.concurrency || project.concurrency);
+          project.batchSize = clampBatchSize(message.batchSize || project.batchSize);
+        });
+        sendResponse(updated ? { ok: true } : { ok: false, error: "Project not found." });
         return;
       }
       case "RETRY_NOT_FOUND": {
@@ -1556,24 +1700,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: false, error: "Stop this project before retrying." });
           return;
         }
-        const project = await getProject(message.projectId);
-        if (!project) {
-          sendResponse({ ok: false, error: "Project not found." });
-          return;
-        }
-        let count = 0;
-        for (const item of project.queue) {
-          if (item.status === "not_found") {
-            item.status = "pending";
-            item.attempts = 0;
-            count++;
-          }
-        }
-        if (count > 0) {
-          await saveProject(project);
-          await updateIndexCounts(project);
-        }
-        sendResponse({ ok: true, count });
+        const { meta, count } = await updateItemsWithStatus(message.projectId, "not_found", (item) => {
+          item.status = "pending";
+          item.attempts = 0;
+        });
+        sendResponse(meta ? { ok: true, count } : { ok: false, error: "Project not found." });
         return;
       }
       case "DELETE_PROJECT": {
@@ -1600,9 +1731,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           await closeWorkerSurfaces(engineBefore.workers);
           chrome.action.setBadgeText({ text: "" });
         }
-        delete index[message.projectId];
-        await saveProjectIndex(index);
-        await deleteProjectStorage(message.projectId);
+        await withDataLock(async () => {
+          const meta = await getMeta(message.projectId);
+          const fresh = await getProjectIndex();
+          delete fresh[message.projectId];
+          await saveProjectIndex(fresh);
+          await chrome.storage.local.remove(projectDataKeys(message.projectId, meta ? meta.chunkCount : 0));
+        });
+        cleanupOrphanData(); // catches pieces of a project whose meta was already gone
         sendResponse({ ok: true });
         return;
       }
@@ -1612,7 +1748,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: false, error: "Another project is currently running - stop it first." });
           return;
         }
-        const project = await getProject(message.projectId);
+        const project = await getMeta(message.projectId);
         if (!project) {
           sendResponse({ ok: false, error: "Project not found." });
           return;
@@ -1674,31 +1810,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // extension itself created (see ownsWindow). Companies that were in
         // flight never left "pending", so Start picks them up again.
         await closeWorkerSurfaces(before.workers);
-        const project = stopped.activeProjectId ? await getProject(stopped.activeProjectId) : null;
+        const project = stopped.activeProjectId ? await getMeta(stopped.activeProjectId) : null;
         updateBadge(stopped, project);
         sendResponse({ ok: true });
         return;
       }
       case "RESUME": {
         const engineBefore = await getEngine();
-        const project = engineBefore.activeProjectId ? await getProject(engineBefore.activeProjectId) : null;
-        if (!project) {
-          sendResponse({ ok: false, error: "That project no longer exists." });
-          return;
-        }
         // Blocked companies were never answered - a CAPTCHA got in the way,
         // which says nothing about the company - so resuming searches them
         // again rather than leaving them for a manual pass.
-        let requeued = 0;
-        for (const item of project.queue) {
-          if (item.status === "blocked") {
-            item.status = "pending";
-            requeued++;
-          }
-        }
-        if (requeued) {
-          await saveProject(project);
-          await updateIndexCounts(project);
+        const { meta: project } = engineBefore.activeProjectId
+          ? await updateItemsWithStatus(engineBefore.activeProjectId, "blocked", (item) => {
+              item.status = "pending";
+            })
+          : { meta: null };
+        if (!project) {
+          sendResponse({ ok: false, error: "That project no longer exists." });
+          return;
         }
         const resumed = await mutateEngine(() => ({
           isRunning: true,
@@ -1721,7 +1850,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
       case "GET_PROJECT": {
-        sendResponse(await getProject(message.projectId));
+        // The meta only (settings, counts, rate log) - never the companies,
+        // which the popup reads from storage itself when exporting.
+        sendResponse(await getMeta(message.projectId));
         return;
       }
       default:

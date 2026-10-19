@@ -8,30 +8,38 @@ const bg = loadBackground();
 const popup = loadPopup();
 
 const plain = (v) => JSON.parse(JSON.stringify(v));
+const ARF_STORE = require("../store.js");
+const vm = require("vm");
 
-test("CSV columns are detected by meaning, and every input column is kept", () => {
+test("CSV columns are detected by meaning, and only the ones the extension uses are kept", () => {
   const csv = [
     "Native ID,Company Name,Country,State,City,Company Website,Notes",
-    'IN001,"Green Agro, Pvt Ltd",India,Maharashtra,Pune,greenagro.in,keep me',
+    'IN001,"Green Agro, Pvt Ltd",India,Maharashtra,Pune,greenagro.in,not kept',
     "IN002,Blue Feeds,India,,Nashik,N/A,",
   ].join("\n");
-  const { companies, columns, detected } = popup.parseCsv(csv);
-  assert.deepStrictEqual(plain(columns), ["Native ID", "Company Name", "Country", "State", "City", "Company Website", "Notes"]);
+  const { companies, detected } = popup.parseCsv(csv);
   assert.deepStrictEqual(plain(detected), {
     native_id: "Native ID", website: "Company Website", company_name: "Company Name",
     city: "City", state: "State", country: "Country",
   });
-  assert.strictEqual(companies[0].company_name, "Green Agro, Pvt Ltd");
-  assert.strictEqual(companies[0].website, "greenagro.in");
-  assert.strictEqual(companies[0].original.Notes, "keep me");
-  // "N/A" is not sent to the AI as a website - but is exported untouched.
+  assert.deepStrictEqual(plain(companies[0]), {
+    native_id: "IN001", company_name: "Green Agro, Pvt Ltd", website: "greenagro.in",
+    city: "Pune", state: "Maharashtra", country: "India", location: "",
+  });
+  // "N/A" is not sent to the AI as a website.
   assert.strictEqual(companies[1].website, "");
-  assert.strictEqual(companies[1].original["Company Website"], "N/A");
+});
+
+test("a lead_id column is the native id", () => {
+  const { companies, detected } = popup.parseCsv("lead_id,company_name,city\nL9,Green Agro,Pune");
+  assert.strictEqual(detected.native_id, "lead_id");
+  assert.strictEqual(companies[0].native_id, "L9");
 });
 
 test("rows sharing a native id still get separate internal ids", () => {
   const { companies } = popup.parseCsv("native_id,company\nX1,A\nX1,B");
-  assert.notStrictEqual(companies[0].id, companies[1].id);
+  const ids = ARF_STORE.buildChunks(companies).flatMap((c) => c.items.map((it) => it.id));
+  assert.deepStrictEqual(ids, ["r0", "r1"]);
 });
 
 test("the question names the website when there is one, and the location otherwise", () => {
@@ -114,10 +122,11 @@ test("export rows split role by role between the two files, with codes and busin
   ]);
 });
 
-test("an input column with the same name as an added one doesn't collide", () => {
-  assert.deepStrictEqual(plain(popup.resultHeader(["Company", "Description"], ["description", "entity"])), [
-    "Company", "Description", "description_found", "entity",
-  ]);
+test("every export has the same fixed columns, whatever the input file called them", () => {
+  // Top-level consts of a script are reachable from later code run in its context.
+  assert.deepStrictEqual(plain(vm.runInContext("INPUT_COLUMNS", popup)), ["native_id", "company_name", "country", "state", "city", "website"]);
+  assert.deepStrictEqual(plain(vm.runInContext("RESULT_COLUMNS", popup)), ["description", "entity", "roles", "business_type"]);
+  assert.deepStrictEqual(plain(popup.inputCells({ native_id: "L9", company_name: "A", city: "Pune" })), ["L9", "A", "", "", "Pune", ""]);
 });
 
 test("CSV output quotes every cell and neutralises formula-like values", () => {

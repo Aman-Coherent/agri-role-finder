@@ -139,8 +139,7 @@ function detectColumns(normalizedHeaders) {
 
 // Placeholder text spreadsheets use for "no value". Treated as empty for
 // the fields we read - a website of "N/A" sent to the AI as the company's
-// "official website" would actively mislead it. The original cell is still
-// exported exactly as it was.
+// "official website" would actively mislead it.
 const EMPTY_CELL_RE = /^(n\/?a|na|none|null|nil|-+|0|\.)$/i;
 
 function cellValue(cols, idx) {
@@ -149,10 +148,12 @@ function cellValue(cols, idx) {
   return EMPTY_CELL_RE.test(v) ? "" : v;
 }
 
-// Returns { companies, columns, detected } or null. `columns` is the input
-// file's header row exactly as written - every export starts with it.
-// `detected` maps each field we use to the header it was read from, so the
-// popup can show which columns were picked.
+// Returns { companies, detected } or null. Only the columns the extension
+// uses are kept - native id, company name, website, city, state, country,
+// and a combined address as a fallback location. The rest of the file (often
+// dozens of columns) is dropped here; results are joined back to it on
+// native_id. `detected` maps each field to the header it was read from, so
+// the popup can show which columns were picked.
 function parseCsv(text) {
   const clean = text.replace(/^\uFEFF/, ""); // strip BOM some exporters add
   const rows = parseCsvRows(clean);
@@ -173,31 +174,21 @@ function parseCsv(text) {
   const detected = {};
   for (const [field, i] of Object.entries(idx)) detected[field] = rawHeaders[i];
 
+  // Internal ids ("r0", "r1", ...) are assigned later, in storage order (see
+  // ARF_STORE.buildChunks) - unique even when two rows share a native_id.
   const companies = rows
     .slice(1)
-    .map((cols, i) => {
-      const original = {};
-      rawHeaders.forEach((h, c) => {
-        original[h] = cols[c] || "";
-      });
-      const native_id = cellValue(cols, idx.native_id);
-      return {
-        // Internal only, and unique even when two rows share a native_id -
-        // results are filed against this, so a collision would put one
-        // company's answer on another's row.
-        id: `r${i}`,
-        native_id,
-        company_name: cellValue(cols, idx.company_name),
-        website: cellValue(cols, idx.website),
-        city: cellValue(cols, idx.city),
-        state: cellValue(cols, idx.state),
-        country: cellValue(cols, idx.country),
-        location: cellValue(cols, idx.location),
-        original,
-      };
-    })
+    .map((cols) => ({
+      native_id: cellValue(cols, idx.native_id),
+      company_name: cellValue(cols, idx.company_name),
+      website: cellValue(cols, idx.website),
+      city: cellValue(cols, idx.city),
+      state: cellValue(cols, idx.state),
+      country: cellValue(cols, idx.country),
+      location: cellValue(cols, idx.location),
+    }))
     .filter((c) => c.company_name);
-  return { companies, columns: rawHeaders, detected };
+  return { companies, detected };
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +285,46 @@ function renderEngineBanner(engine, summaries) {
   banner.textContent = (engine.isPaused ? "Paused: " : "Running: ") + (meta ? meta.name : "a project");
 }
 
+// Writes the companies into storage in pieces (see store.js) and only then
+// tells background.js the project exists. The list never travels in a
+// message: Chrome refuses messages over 64 MB, which a 50,000-company file
+// easily exceeds. If anything goes wrong half-way, the pieces already
+// written are removed again so no half-imported project is left behind.
+const PIECES_PER_WRITE = 10;
+
+async function createProject(name, companies, detected, settings, onProgress) {
+  const projectId = ARF_STORE.newProjectId();
+  const chunks = ARF_STORE.buildChunks(companies);
+  const written = [];
+  try {
+    for (let i = 0; i < chunks.length; i += PIECES_PER_WRITE) {
+      const entries = {};
+      for (const { n, items } of chunks.slice(i, i + PIECES_PER_WRITE)) entries[ARF_STORE.chunkKey(projectId, n)] = items;
+      await chrome.storage.local.set(entries);
+      written.push(...Object.keys(entries));
+      onProgress(Math.min((i + PIECES_PER_WRITE) * ARF_STORE.CHUNK_SIZE, companies.length));
+    }
+    const res = await chrome.runtime.sendMessage({
+      type: "CREATE_PROJECT",
+      projectId,
+      name,
+      total: companies.length,
+      chunkCount: chunks.length,
+      detected,
+      ...settings,
+    });
+    if (!res || !res.ok) await chrome.storage.local.remove(written);
+    return res;
+  } catch (err) {
+    await chrome.storage.local.remove(written).catch(() => {});
+    throw err;
+  }
+}
+
+let importing = false;
+
 async function refresh() {
+  if (importing) return; // the import's progress line owns the status box
   const { engine, summaries } = await chrome.runtime.sendMessage({ type: "GET_STATE" });
   populateSelect(summaries, engine);
   renderEngineBanner(engine, summaries);
@@ -360,9 +390,8 @@ async function refresh() {
     ? `Showing settings for "${project.name}". Change and click Update to apply.`
     : `Stop "${project.name}" to change its settings.`;
 
-  const counts = { pending: 0, found: 0, blocked: 0, not_found: 0 };
-  for (const c of project.queue) counts[c.status] = (counts[c.status] || 0) + 1;
-  const total = project.queue.length;
+  const counts = { ...ARF_STORE.emptyCounts(), ...(project.counts || {}) };
+  const total = project.total || 0;
   const done = total - counts.pending;
   const batchSize = project.batchSize || 3;
 
@@ -389,16 +418,8 @@ async function refresh() {
 
   const currentItem = document.getElementById("currentItem");
   if (isSelectedTheActiveOne && engine.workers && engine.workers.length) {
-    // Each worker holds an ARRAY of claimed item ids (currentItemIds) since
-    // a batch claims several companies at once - not a single currentItemId
-    // (that field never existed on the engine's worker objects, so this
-    // always evaluated to an empty list and the line below never showed
-    // anything).
-    const inFlightIds = engine.workers.flatMap((w) => w.currentItemIds || []);
-    const names = inFlightIds
-      .map((id) => project.queue.find((c) => c.id === id))
-      .filter(Boolean)
-      .map((c) => c.company_name);
+    // Each worker keeps the names of the batch it is searching.
+    const names = engine.workers.flatMap((w) => w.currentNames || []);
     const shown = names.slice(0, 3).join(", ");
     const extra = names.length > 3 ? ` +${names.length - 3} more` : "";
     currentItem.textContent = names.length ? `Searching: ${shown}${extra}` : "";
@@ -460,12 +481,24 @@ document.getElementById("csvFile").addEventListener("change", async (e) => {
   e.target.value = ""; // reset so choosing the same file again still fires 'change'
   if (!file || !name) return;
 
-  const text = await file.text();
-  const parsed = parseCsv(text);
-  if (!parsed) return;
-  const { companies, columns, detected } = parsed;
+  const status = document.getElementById("status");
+  let parsed;
+  try {
+    status.textContent = `Reading ${file.name}...`;
+    parsed = parseCsv(await file.text());
+  } catch (err) {
+    alert(`Couldn't read that file: ${err.message || err}`);
+    refresh();
+    return;
+  }
+  if (!parsed) {
+    refresh();
+    return;
+  }
+  const { companies, detected } = parsed;
   if (!companies.length) {
     alert("No rows with a company name were found in that file.");
+    refresh();
     return;
   }
 
@@ -473,23 +506,22 @@ document.getElementById("csvFile").addEventListener("change", async (e) => {
   const delayMaxSec = Number(document.getElementById("delayMax").value) || 15;
   const concurrency = Number(document.getElementById("concurrency").value) || 1;
   const batchSize = Number(document.getElementById("batchSize").value) || 3;
-  const res = await chrome.runtime.sendMessage({
-    type: "CREATE_PROJECT",
-    name,
-    companies,
-    columns,
-    detected,
-    delayMinSec,
-    delayMaxSec,
-    concurrency,
-    batchSize,
-  });
-  if (!res || !res.ok) {
-    alert("Couldn't create project" + (res && res.error ? `: ${res.error}` : "."));
-    return;
+  importing = true;
+  try {
+    const res = await createProject(name, companies, detected, { delayMinSec, delayMaxSec, concurrency, batchSize }, (done) => {
+      status.textContent = `Importing ${done.toLocaleString()} of ${companies.length.toLocaleString()} companies - keep this window open...`;
+    });
+    if (!res || !res.ok) {
+      alert("Couldn't create project" + (res && res.error ? `: ${res.error}` : "."));
+    } else {
+      selectedProjectId = res.projectId;
+    }
+  } catch (err) {
+    alert(`Couldn't create project: ${err.message || err}`);
+  } finally {
+    importing = false;
+    refresh();
   }
-  selectedProjectId = res.projectId;
-  refresh();
 });
 
 document.getElementById("updateSettingsBtn").addEventListener("click", async () => {
@@ -530,18 +562,15 @@ document.getElementById("resumeBtn").addEventListener("click", async () => {
   refresh();
 });
 
-// The columns this extension adds after the input file's own. If the input
-// already has a column with one of these names, ours gets a suffix rather
-// than producing two identically-named columns.
+// Every export has the same fixed columns: the ones read from the input
+// file, under fixed names (whatever the file called them - "Lead ID",
+// "Company Name"...), then what was found. Results are joined back to the
+// original file on native_id.
+const INPUT_COLUMNS = ["native_id", "company_name", "country", "state", "city", "website"];
 const RESULT_COLUMNS = ["description", "entity", "roles", "business_type"];
 
-function resultHeader(inputColumns, added) {
-  const taken = new Set(inputColumns.map((c) => c.toLowerCase()));
-  return [...inputColumns, ...added.map((c) => (taken.has(c) ? `${c}_found` : c))];
-}
-
-function originalCells(project, item) {
-  return project.columns.map((c) => (item.original || {})[c] ?? "");
+function inputCells(item) {
+  return INPUT_COLUMNS.map((c) => item[c] || "");
 }
 
 function rolesCell(roles) {
@@ -588,34 +617,37 @@ async function getSelectedProject() {
   return chrome.runtime.sendMessage({ type: "GET_PROJECT", projectId: selectedProjectId });
 }
 
+// Every company of a project, piece by piece, straight from storage - a big
+// project's companies never fit in one message.
+async function forEachItem(project, fn) {
+  for (let n = 0; n < project.chunkCount; n++) {
+    const key = ARF_STORE.chunkKey(project.id, n);
+    const items = (await chrome.storage.local.get(key))[key] || [];
+    for (const item of items) fn(item);
+  }
+}
+
 async function exportClassified(which, filename) {
   const project = await getSelectedProject();
   if (!project) return;
   const rows = [];
-  for (const item of project.queue) {
-    if (item.status !== "found") continue;
-    const parts = splitClassifications(item)[which];
-    for (const part of parts) {
-      rows.push([
-        ...originalCells(project, item),
-        item.description || "",
-        part.entity,
-        rolesCell(part.roles),
-        businessTypeCell(part.roles),
-      ]);
+  await forEachItem(project, (item) => {
+    if (item.status !== "found") return;
+    for (const part of splitClassifications(item)[which]) {
+      rows.push([...inputCells(item), item.description || "", part.entity, rolesCell(part.roles), businessTypeCell(part.roles)]);
     }
-  }
-  downloadCsv(filename, toCsv(resultHeader(project.columns, RESULT_COLUMNS), rows));
+  });
+  downloadCsv(filename, toCsv([...INPUT_COLUMNS, ...RESULT_COLUMNS], rows));
 }
 
 async function exportByStatus(status, filename, withDescription) {
   const project = await getSelectedProject();
   if (!project) return;
-  const added = withDescription ? ["description"] : [];
-  const rows = project.queue
-    .filter((item) => item.status === status)
-    .map((item) => [...originalCells(project, item), ...(withDescription ? [item.description || ""] : [])]);
-  downloadCsv(filename, toCsv(resultHeader(project.columns, added), rows));
+  const rows = [];
+  await forEachItem(project, (item) => {
+    if (item.status === status) rows.push([...inputCells(item), ...(withDescription ? [item.description || ""] : [])]);
+  });
+  downloadCsv(filename, toCsv([...INPUT_COLUMNS, ...(withDescription ? ["description"] : [])], rows));
 }
 
 document.getElementById("exportOnList").addEventListener("click", () =>

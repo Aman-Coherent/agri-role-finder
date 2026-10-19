@@ -22,17 +22,17 @@ function chromeStub() {
   };
 }
 
-// background.js as the service worker sees it: importScripts("taxonomy.js")
-// is honoured by evaluating that file into the same context first.
+// background.js as the service worker sees it: importScripts(...) is
+// honoured by evaluating those files into the same context first.
 function loadBackground() {
   const ctx = vm.createContext({ console, setTimeout, clearTimeout, URL, URLSearchParams, chrome: chromeStub() });
   ctx.globalThis = ctx;
-  ctx.importScripts = (file) => vm.runInContext(fs.readFileSync(path.join(ROOT, file), "utf8"), ctx);
+  ctx.importScripts = (...files) => files.forEach((f) => vm.runInContext(fs.readFileSync(path.join(ROOT, f), "utf8"), ctx));
   vm.runInContext(fs.readFileSync(path.join(ROOT, "background.js"), "utf8"), ctx);
   return ctx;
 }
 
-// popup.js as popup.html loads it: taxonomy.js first, then popup.js, with a
+// popup.js as popup.html loads it: taxonomy.js and store.js first, with a
 // fake document whose elements accept anything.
 function loadPopup() {
   const el = () => ({ addEventListener() {}, style: {}, value: "", textContent: "", appendChild() {}, options: [] });
@@ -42,7 +42,7 @@ function loadPopup() {
     document: { getElementById: el, createElement: el, activeElement: null },
   });
   ctx.globalThis = ctx;
-  vm.runInContext(fs.readFileSync(path.join(ROOT, "taxonomy.js"), "utf8"), ctx);
+  for (const f of ["taxonomy.js", "store.js"]) vm.runInContext(fs.readFileSync(path.join(ROOT, f), "utf8"), ctx);
   vm.runInContext(fs.readFileSync(path.join(ROOT, "popup.js"), "utf8"), ctx);
   return ctx;
 }

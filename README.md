@@ -39,7 +39,13 @@ long run.
 - **If a row has a website**, the AI is told to use it as the main source.
 - **If not**, it identifies the company by name and location.
 - Values like `N/A`, `-` or `none` count as empty.
-- **Every column of your file is kept** and copied into every export.
+- **Only these columns are kept.** Any other columns in your file are
+  ignored. To see them next to the results, join the results back to your
+  file on `native_id`.
+- **Big files are fine.** A 50,000-company file is saved in pieces of 500,
+  with an "Importing ... of ..." counter. **Keep the popup open until it
+  finishes.** If it gets closed half-way, nothing half-imported is left
+  behind: just create the project again.
 
 ## How it works, step by step
 
@@ -88,6 +94,12 @@ long run.
 ## Downloads
 
 One row per **company + entity**. Roles inside a cell are separated by `;`.
+
+Every file has the same columns, whatever your input file called them:
+
+`native_id, company_name, country, state, city, website`, then
+`description, entity, roles, business_type` (not_found.csv has
+`description`; needs_review.csv has just the first six).
 
 | File | What's in it |
 |---|---|
