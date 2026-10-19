@@ -72,7 +72,8 @@ function loadPage(clock, page, session) {
         return { innerText: page.text };
       },
       documentElement: {},
-      querySelector: () => null,
+      // The results page's AI Mode tab, if the test page has one.
+      querySelector: (sel) => (page.aiModeTab && sel.includes("udm=50") ? { click: () => page.aiModeTab.onClick() } : null),
       querySelectorAll: () => [],
     },
     location: { pathname: "/search", reload: () => reloads.count++ },
@@ -178,4 +179,115 @@ test("a partly written answer is still given the long patience (Google pauses mi
   const result = loaded.sent.find((m) => m.type === "RESULT");
   assert.ok(result, "reported once the page stayed quiet for 45s");
   assert.deepStrictEqual(result.results.map((r) => r.status), ["found", "missing", "missing"]);
+});
+
+// --- The AI Mode step ---
+
+const AI_MODE_ANSWER = `AI Mode  All  Forums  Shopping  Images  More
+I will list 3 agriculture-sector companies. For EACH one: if a website is given, use that official website as the main source...
+` + [1, 2, 3]
+  .map((i) => `COMPANY ${i}\nDESCRIPTION: Company ${i} makes fertilizers.\nENTITY: Fertilizers | ROLES: Fertilizer Manufacturer [Manufacturer]`)
+  .join("\n") + "\nEND OF ANSWERS\nAsk anything";
+
+const NO_RESULTS_PAGE = `AI Mode  All  Forums  Shopping  Images  Videos  News  More  Tools
+No results found for I will list 3 agriculture-sector companies. For EACH one: if a website is given...`;
+
+test("no AI Overview: after ~15s the AI Mode tab is clicked (not a reload), and its answer is read", async () => {
+  const clock = makeClock();
+  const page = { text: NO_RESULTS_PAGE, clicks: 0 };
+  // Google switches to AI Mode in place; AI Mode thinks, then answers.
+  page.aiModeTab = {
+    onClick() {
+      page.clicks++;
+      page.text = "AI Mode\nI will list 3 agriculture-sector companies...\nThinking\nAsk anything";
+      clock.setTimeout(() => (page.text = AI_MODE_ANSWER), 20000);
+    },
+  };
+  const loaded = loadPage(clock, page, new Map());
+  const waited = await runUntilDone(clock, loaded, 300);
+
+  assert.strictEqual(page.clicks, 1, "AI Mode tab clicked once");
+  assert.strictEqual(loaded.reloads.count, 0, "no reload needed");
+  assert.ok(loaded.sent.some((m) => m.type === "RETRY_SEARCH"), "engine told, so AI Mode gets its own time window");
+  const result = loaded.sent.find((m) => m.type === "RESULT");
+  assert.ok(result, "the AI Mode answer was reported");
+  assert.deepStrictEqual(result.results.map((r) => r.status), ["found", "found", "found"]);
+  assert.strictEqual(result.results[0].entities[0].entity, "Fertilizers");
+  assert.ok(waited < 60, `answered after ${waited}s`);
+});
+
+test("if clicking AI Mode loads a new page, that page carries on with the AI Mode step", async () => {
+  const clock = makeClock();
+  const session = new Map();
+  const page = { text: NO_RESULTS_PAGE, clicks: 0 };
+  page.aiModeTab = { onClick: () => page.clicks++ };
+  const first = loadPage(clock, page, session);
+  first.api.runBatch(ITEMS, "b_1");
+  await clock.advance(16000);
+  assert.strictEqual(page.clicks, 1);
+
+  // The AI Mode page loads (a new copy of the script, same tab session).
+  const aiPage = { text: AI_MODE_ANSWER, clicks: 0 };
+  aiPage.aiModeTab = { onClick: () => aiPage.clicks++ };
+  const second = loadPage(clock, aiPage, session);
+  const waited = await runUntilDone(clock, second, 120);
+  const result = second.sent.find((m) => m.type === "RESULT");
+  assert.ok(result, "reported from the AI Mode page");
+  assert.deepStrictEqual(result.results.map((r) => r.status), ["found", "found", "found"]);
+  assert.strictEqual(aiPage.clicks, 0, "AI Mode is not clicked again from AI Mode");
+  assert.ok(waited <= 2, `read straight away (${waited}s)`);
+});
+
+test("AI Mode researching silently for 35s is not given up on", async () => {
+  const clock = makeClock();
+  const page = { text: NO_RESULTS_PAGE };
+  page.aiModeTab = {
+    onClick() {
+      page.text = "AI Mode\nI will list 3 agriculture-sector companies...\nAsk anything"; // nothing changing
+      clock.setTimeout(() => (page.text = AI_MODE_ANSWER), 35000);
+    },
+  };
+  const loaded = loadPage(clock, page, new Map());
+  await runUntilDone(clock, loaded, 300);
+  const result = loaded.sent.find((m) => m.type === "RESULT");
+  assert.ok(result);
+  assert.deepStrictEqual(result.results.map((r) => r.status), ["found", "found", "found"]);
+});
+
+test("AI Mode empty too: one reload, then report missing and move on - AI Mode is tried only once", async () => {
+  const clock = makeClock();
+  const session = new Map();
+  const emptyAi = "AI Mode\nI will list 3 agriculture-sector companies...\nAsk anything";
+  const page = { text: NO_RESULTS_PAGE, clicks: 0 };
+  page.aiModeTab = { onClick: () => { page.clicks++; page.text = emptyAi; } };
+
+  const first = loadPage(clock, page, session);
+  await runUntilDone(clock, first, 300);
+  assert.strictEqual(page.clicks, 1);
+  assert.strictEqual(first.reloads.count, 1, "AI Mode page reloaded once");
+
+  const reloaded = loadPage(clock, page, session); // the reloaded AI Mode page
+  const waited = await runUntilDone(clock, reloaded, 300);
+  assert.strictEqual(page.clicks, 1, "not clicked again");
+  assert.strictEqual(reloaded.reloads.count, 0);
+  const result = reloaded.sent.find((m) => m.type === "RESULT");
+  assert.ok(result, "reported - the run moves on");
+  assert.deepStrictEqual(result.results.map((r) => r.status), ["missing", "missing", "missing"]);
+  assert.strictEqual(result.noAiAnswer, true, "doesn't count towards pausing the run");
+  assert.ok(waited <= 47, `gave up after ${waited}s`);
+});
+
+test("an AI Overview that does answer is used as before - AI Mode is not touched", async () => {
+  const clock = makeClock();
+  const page = {
+    text: `AI Overview\n` + [1, 2, 3]
+      .map((i) => `COMPANY ${i}\nDESCRIPTION: Company ${i} sells seeds.\nENTITY: Seeds & biologicals | ROLES: Seed Distributor [Distributor]`)
+      .join("\n") + "\nEND OF ANSWERS",
+    clicks: 0,
+  };
+  page.aiModeTab = { onClick: () => page.clicks++ };
+  const loaded = loadPage(clock, page, new Map());
+  await runUntilDone(clock, loaded, 60);
+  assert.strictEqual(page.clicks, 0);
+  assert.deepStrictEqual(loaded.sent.find((m) => m.type === "RESULT").results.map((r) => r.status), ["found", "found", "found"]);
 });

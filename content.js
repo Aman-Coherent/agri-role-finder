@@ -17,10 +17,21 @@
  * on their "COMPANY <n>" line - text the AI typed, which (unlike an HTML
  * list's auto-generated numbers) is really in the page - so one skipped
  * company doesn't shift every answer after it onto the wrong company. A
- * company with no block is never guessed at: if the whole answer came back
- * empty the search is RELOADED once, and anything still unanswered after
- * that is reported "missing" - background.js puts it back in the queue once
- * (it joins a later batch) before recording it not_found.
+ * company with no block is never guessed at.
+ *
+ * Two places Google can answer, tried in this order:
+ *   1. the AI Overview on the normal results page;
+ *   2. if there is none, the page's own "AI Mode" tab - clicked, exactly as
+ *      a person would. AI Mode is a chat built for long questions, and it
+ *      reliably answers this one when the normal page shows "No results
+ *      found". (Opening AI Mode directly - &udm=50 in the URL - does NOT
+ *      work from an extension: Chrome moves it to a chrome:// page no
+ *      extension can read. Clicking the tab on the page is an ordinary page
+ *      navigation and stays readable.)
+ * Same question, same answer format, same checks either way. If neither
+ * answers, the companies are reported "missing" - background.js puts them
+ * back in the queue once (they join a later batch) before recording them
+ * not_found.
  *
  * This script only reports what the AI wrote. Whether each entity/role is on
  * the list is decided in background.js against taxonomy.js.
@@ -103,6 +114,12 @@
   // and waiting longer only stalls the run. The search is then reloaded once
   // (see runBatch) and, if still nothing, the run moves on.
   const NO_AI_ANSWER_MS = 15000;
+  // In AI Mode, nothing on the page yet does NOT mean no answer is coming:
+  // AI Mode researches first (often 10-40s, with little or no visible text
+  // changing) and only then writes. So an empty AI Mode page is given the
+  // long "mid-answer" patience instead of ANSWER_QUIET_MS, and the 15s
+  // no-answer exit doesn't apply there at all.
+  const AI_MODE_EMPTY_QUIET_MS = 45000;
   // Google's answer streaming fires mutations in bursts; re-reading the page on
   // every single one would mean hundreds of full innerText reads a second.
   // Coalesced on a timestamp rather than a timer, because a timer is the one
@@ -231,6 +248,26 @@
       return;
     }
   }
+
+  // The "AI Mode" tab in the results page's own tab row (All, Images, News...).
+  // Its link carries udm=50; failing that, any clickable element labelled
+  // exactly "AI Mode". Only ever clicked, never navigated to directly - see
+  // the header comment.
+  function findAiModeTab() {
+    if (!document.body) return null;
+    const byLink = document.querySelector("a[href*='udm=50']");
+    if (byLink) return byLink;
+    for (const el of document.querySelectorAll("a, button, [role='link'], [role='tab'], [role='button']")) {
+      if ((el.textContent || "").replace(/\s+/g, " ").trim() === "AI Mode") return el;
+    }
+    return null;
+  }
+
+  // How long to wait after clicking the AI Mode tab for Google to switch the
+  // page. A real page load ends this script (the next page's copy carries on
+  // - see runBatch); if Google switches without one, this same script simply
+  // continues on the AI Mode page afterwards.
+  const AI_MODE_SWITCH_MS = 3000;
 
   // Google shows a status line like "Searching..." or "Generating" while its
   // AI answer is still being researched/written - a "not finished yet"
@@ -602,6 +639,11 @@
 
   async function runBatch(items, batchToken) {
     const n = items.length;
+    // Remembered per tab across page loads (sessionStorage), so the page
+    // that loads after the AI Mode tab is clicked knows it is the AI Mode
+    // step - and so a batch only ever tries AI Mode once.
+    const aiModeKey = `arfAiMode_${batchToken}`;
+    const inAiMode = sessionStorage.getItem(aiModeKey) === "1";
     const waitMs = Math.min(ANSWER_BASE_MS + ANSWER_PER_ITEM_MS * n, ANSWER_MAX_MS);
     const started = Date.now();
     const readyFn = (text) => {
@@ -611,9 +653,12 @@
     const quietMsFn = (text) => {
       const answered = answeredCount(parseAnswer(text, n), n);
       if (answered === n) return COMPLETE_QUIET_MS;
-      return answered > 0 ? PARTIAL_QUIET_MS : ANSWER_QUIET_MS;
+      if (answered > 0) return PARTIAL_QUIET_MS;
+      return inAiMode ? AI_MODE_EMPTY_QUIET_MS : ANSWER_QUIET_MS;
     };
-    const noAnswerFn = (text) => !hasAiAnswerSign(text) && answeredCount(parseAnswer(text, n), n) === 0;
+    const noAnswerFn = inAiMode
+      ? () => false
+      : (text) => !hasAiAnswerSign(text) && answeredCount(parseAnswer(text, n), n) === 0;
     let outcome = await waitForAnswer(readyFn, quietMsFn, noAnswerFn, waitMs);
 
     // A CAPTCHA that appeared mid-wait: hand it to a human, then give the
@@ -633,21 +678,39 @@
     const parsed = parseAnswer(answerText, n);
     const answered = answeredCount(parsed, n);
 
-    // Nothing at all came back for this search. Reload the exact same query
-    // ONCE - Google frequently answers on a second attempt when the first
-    // produced no answer panel. If the retry is also empty, every company is
-    // reported "missing" below and the run moves on (background.js gives
-    // each one more try in a later batch).
+    // Nothing at all came back on the normal results page: ask AI Mode, by
+    // clicking its tab - once per batch. The engine is told first, so its
+    // stuck-tab timer allows the AI Mode answer a full window of its own.
     //
     // Only a completely empty answer triggers this. If even one company
-    // parsed, that data is reported immediately instead - a reload would
+    // parsed, that data is reported immediately instead - asking again would
     // re-ask the whole batch and could come back worse, and the engine only
     // accepts one RESULT per batch.
+    if (answered === 0 && !inAiMode) {
+      const aiModeTab = findAiModeTab();
+      if (aiModeTab) {
+        sessionStorage.setItem(aiModeKey, "1");
+        debug(`runBatch: no AI Overview (outcome ${outcome}) for ${n} companies - opening the AI Mode tab`);
+        chrome.runtime.sendMessage({ type: "RETRY_SEARCH", batchToken });
+        aiModeTab.click();
+        // A page load ends this script here; the AI Mode page's own copy
+        // runs the AI Mode step. If Google switched without one, carry on.
+        await new Promise((r) => setTimeout(r, AI_MODE_SWITCH_MS));
+        await runBatch(items, batchToken);
+        return;
+      }
+    }
+
+    // Still nothing, and no AI Mode tab to try (or AI Mode already tried and
+    // came back empty on a first load): reload the exact same page ONCE -
+    // Google frequently answers on a second attempt. If the retry is also
+    // empty, every company is reported "missing" below and the run moves on
+    // (background.js gives each one more try in a later batch).
     if (answered === 0) {
       const retryKey = `arfBatchRetried_${batchToken}`;
       if (sessionStorage.getItem(retryKey) !== "1") {
         sessionStorage.setItem(retryKey, "1");
-        debug(`runBatch: no answer at all (outcome ${outcome}) for ${n} companies - reloading this search once`);
+        debug(`runBatch: no answer at all (outcome ${outcome}, ${inAiMode ? "AI Mode" : "results page"}) for ${n} companies - reloading once`);
         // Re-arm the watchdog first: a second full wait would otherwise run
         // past the deadline armed for the first one.
         chrome.runtime.sendMessage({ type: "RETRY_SEARCH", batchToken });
@@ -677,6 +740,7 @@
       waitedMs: Date.now() - started,
       answered,
       endLineSeen: parsed.ended,
+      answeredBy: inAiMode ? "AI Mode" : "AI Overview",
       aiAnswerOnPage: hasAiAnswerSign(answerText),
       pageTextLength: answerText.length,
       results,
@@ -686,6 +750,8 @@
     // towards pausing the run (see emptyStreakPatch). Decided from the page
     // itself, not from which exit ended the wait: a static page with no AI
     // panel usually goes quiet (12s) before NO_AI_ANSWER_MS (15s) is reached.
+    // AI Mode has no "AI Overview" heading, so an empty AI Mode page counts
+    // here too.
     const noAiAnswer = answered === 0 && !hasAiAnswerSign(answerText);
     chrome.runtime.sendMessage({ type: "RESULT", batchToken, results, noAiAnswer });
   }
@@ -693,7 +759,7 @@
   // Exposed for the offline parser tests only (see tests/). In the extension
   // this script is never loaded as a module, so this branch never runs.
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { parseAnswer, parseBlock, answeredCount, waitForAnswer, isStillGenerating, hasAiAnswerSign, runBatch };
+    module.exports = { parseAnswer, parseBlock, answeredCount, waitForAnswer, isStillGenerating, hasAiAnswerSign, findAiModeTab, runBatch };
     return;
   }
 

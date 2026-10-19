@@ -59,16 +59,18 @@ long run.
    ENTITY: Seeds & biologicals | ROLES: Seed Distributor [Distributor]; Seed Importer / Exporter [Exporter]
    END OF ANSWERS
    ```
-3. It reads the answer. Each `COMPANY <number>` block is matched to its
+3. **If the normal page shows no AI Overview, it clicks the AI Mode tab** and
+   asks there instead (see **When things go wrong**).
+4. It reads the answer. Each `COMPANY <number>` block is matched to its
    company by number, so if the AI skips one company, the others still go to
    the right rows.
-4. **The extension itself checks each entity and role against the list.** It
+5. **The extension itself checks each entity and role against the list.** It
    ignores small differences like capitals, "&" vs "and", or a code the AI
    copied, and always writes the list's own spelling. The code comes from
    the list, never from the AI, and the AI's business type is only kept if
    that code allows it (see **business_type** below).
-5. It waits a random 8-15 seconds, then does the next 3.
-6. **CAPTCHA**: the run pauses and brings that tab to the front. You solve
+6. It waits a random 8-15 seconds, then does the next 3.
+7. **CAPTCHA**: the run pauses and brings that tab to the front. You solve
    it, and the run continues by itself. It never solves one for you. See
    **When things go wrong** below for the details.
 
@@ -81,7 +83,7 @@ long run.
 | **CAPTCHA right on the results page** | Same: pauses, waits for you, resumes. |
 | **Google's cookie-consent page** ("Before you continue") | Same as a CAPTCHA: answer it once in that tab and the run continues. |
 | **CAPTCHA not solved within 10 minutes** | Those companies are marked blocked and the run stays paused. **Resume** searches them again. |
-| **No AI Overview at all**, just normal search results | After **15 seconds** with no AI Overview on the page, it reloads the search **once**. If there's still none after another 15 seconds, it moves on to the next search. Those companies get one more try later, in a different batch. These pages never pause the run, because Google answered fine, it just had no AI answer. |
+| **No AI Overview at all**, just normal search results (or "No results found") | After **15 seconds** with no AI Overview, it **clicks the page's "AI Mode" tab**, the same as you would by hand, and reads the answer there. It's the same question and the same checks; AI Mode is built for long questions and usually answers. If AI Mode gives nothing either, it reloads once, then moves on. Those companies get one more try later, in a different batch. These pages never pause the run. |
 | **Empty answer, or Google says "Something went wrong"** | Reloads that search once. |
 | **The AI skips a company** in its answer | The company goes back in the queue once and is asked again in a later batch, alongside different companies. Only after a second miss is it recorded not found. |
 | **The AI says NONE** (it has no information) | Recorded not found straight away. The AI looked and didn't know, so asking again rarely helps. |

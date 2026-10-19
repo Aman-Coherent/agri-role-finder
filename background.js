@@ -1333,6 +1333,19 @@ async function handleWorkerTabUrl(tabId, url, isUrlChange) {
   if (!(worker.currentItemIds || []).length) return;
   const waiting = engine.captchaTabIds.includes(tabId);
 
+  // Chrome moved the page onto its own AI Mode surface, which no extension
+  // can read - e.g. if a Chrome update starts doing that for the AI Mode tab
+  // content.js clicks, too. Back to the batch's normal search: content.js
+  // remembers AI Mode was already tried for this batch, so it won't click
+  // again, and the batch finishes (or moves on) from there.
+  if (isContextualTasksUrl(url) && worker.searchUrl) {
+    await renavigateWorkerTab(
+      workerIndex, worker.batchToken, tabId, worker.searchUrl,
+      "Chrome opened AI Mode on a chrome:// page extensions can't read - back to the normal search"
+    );
+    return;
+  }
+
   if (isSorryUrl(url)) {
     if (!waiting) await markNeedsHuman(workerIndex, tabId, "captcha");
     if (isUrlChange && url.length > MAX_WORKING_SORRY_URL_LEN) {

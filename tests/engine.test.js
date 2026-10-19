@@ -617,3 +617,15 @@ test("searches where Google shows no AI Overview never pause the run - it just m
   assert.ok(h.items().every((c) => c.status === "not_found" && c.attempts === 2), "each company got its 2 tries");
   assert.strictEqual(batches, 20, "30 companies x 2 tries / 3 per search");
 });
+
+test("if Chrome moves the AI Mode page to its unreadable chrome:// page, the tab goes straight back to the search", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(["A", "B"]));
+  const tab = h.workerTab();
+  const searchUrl = tab.url;
+  h.navigate(tab.id, "chrome://contextual-tasks/?q=I%20will%20list");
+  await settle();
+  assert.strictEqual(h.tabs.get(tab.id).url, searchUrl);
+  await h.answer(answers());
+  assert.strictEqual(h.byName("A").status, "found");
+});
