@@ -81,11 +81,12 @@ long run.
 | **CAPTCHA right on the results page** | Same: pauses, waits for you, resumes. |
 | **Google's cookie-consent page** ("Before you continue") | Same as a CAPTCHA: answer it once in that tab and the run continues. |
 | **CAPTCHA not solved within 10 minutes** | Those companies are marked blocked and the run stays paused. **Resume** searches them again. |
+| **No AI Overview at all**, just normal search results | After **15 seconds** with no AI Overview on the page, it reloads the search **once**. If there's still none after another 15 seconds, it moves on to the next search. Those companies get one more try later, in a different batch. These pages never pause the run, because Google answered fine, it just had no AI answer. |
 | **Empty answer, or Google says "Something went wrong"** | Reloads that search once. |
 | **The AI skips a company** in its answer | The company goes back in the queue once and is asked again in a later batch, alongside different companies. Only after a second miss is it recorded not found. |
 | **The AI says NONE** (it has no information) | Recorded not found straight away. The AI looked and didn't know, so asking again rarely helps. |
 | **A tab gets stuck** (page didn't load, internet blip) | After a few minutes it's given up on. Its companies count one missed try (as above) and the run moves on. |
-| **Several searches in a row get no answer at all** (4) | The run **pauses** instead of marking the whole list not found, so you can check what's wrong (internet down, Google not showing AI answers). Click Resume once it's fixed. |
+| **Several searches in a row fail completely** (4): the page never loads, or Google's AI answer can't be read | The run **pauses** instead of marking the whole list not found, so you can check what's wrong (internet down, Google changed its page). Click Resume once it's fixed. |
 | **Google folds the answer behind "Show more"** | Clicks it (only buttons, never links), and also reads the hidden text. |
 | **You close a worker tab** mid-search | Nothing is lost: its companies stay queued and get a new tab. If it was the CAPTCHA tab, the run stays paused until Resume. |
 | **Chrome restarts, or the extension is reloaded,** mid-run | The run is paused with a message. **Resume** continues exactly where it stopped. |

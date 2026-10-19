@@ -154,7 +154,7 @@ function makeHarness() {
     },
     // Plays the content script on the worker tab: read the batch, "answer"
     // it with answerFor(items), parse that with the real parser, report.
-    async answer(answerFor) {
+    async answer(answerFor, extra = {}) {
       const tab = workerTab();
       assert.ok(tab && tab.url.startsWith(SEARCH), "worker tab should be on a search page");
       const sender = { tab: { id: tab.id, url: tab.url } };
@@ -167,7 +167,7 @@ function makeHarness() {
         if (!b || !b.answered) return { itemId: it.itemId, status: "missing" };
         return { itemId: it.itemId, status: b.entities.length ? "found" : "not_found", description: b.description, entities: b.entities };
       });
-      await send({ type: "RESULT", batchToken: current.batchToken, results }, sender);
+      await send({ type: "RESULT", batchToken: current.batchToken, results, ...extra }, sender);
       await settle();
       return current.items.map((it) => it.company_name);
     },
@@ -601,4 +601,19 @@ test("Retry not-found rows only touches the pieces that hold not-found companies
   assert.deepStrictEqual(h.writes.flat().filter((k) => k.startsWith("arfChunk_")), [key]);
   assert.strictEqual(h.byName("C1000").status, "pending");
   assert.strictEqual(h.byName("C1000").attempts, 0);
+});
+
+test("searches where Google shows no AI Overview never pause the run - it just moves on", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(Array.from({ length: 30 }, (_, i) => `C${i}`)));
+  let batches = 0;
+  while (h.workerTab() && h.engine().isRunning && batches < 40) {
+    await h.answer(nothing, { noAiAnswer: true });
+    await h.nextBatch();
+    batches++;
+    assert.strictEqual(h.engine().isPaused, false, `still running after ${batches} empty searches`);
+  }
+  assert.strictEqual(h.engine().isRunning, false, "the run reached the end of the list");
+  assert.ok(h.items().every((c) => c.status === "not_found" && c.attempts === 2), "each company got its 2 tries");
+  assert.strictEqual(batches, 20, "30 companies x 2 tries / 3 per search");
 });

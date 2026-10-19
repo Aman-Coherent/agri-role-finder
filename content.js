@@ -95,6 +95,14 @@
   const ANSWER_QUIET_MS = 12000;
   const PARTIAL_QUIET_MS = 45000;
   const COMPLETE_QUIET_MS = 8000;
+  // How long a results page may go without ANY sign of an AI answer before it
+  // is taken to have none. Google decides on the AI Overview as the page
+  // loads - its "AI Overview" panel appears within a few seconds, even while
+  // the answer itself is still being written - so a page that has none by
+  // now is a plain results page (like a search Google simply didn't answer)
+  // and waiting longer only stalls the run. The search is then reloaded once
+  // (see runBatch) and, if still nothing, the run moves on.
+  const NO_AI_ANSWER_MS = 15000;
   // Google's answer streaming fires mutations in bursts; re-reading the page on
   // every single one would mean hundreds of full innerText reads a second.
   // Coalesced on a timestamp rather than a timer, because a timer is the one
@@ -224,10 +232,24 @@
     }
   }
 
-  // Google shows these while it is still researching/generating - they are a
-  // "not finished yet" signal, never an answer.
+  // Google shows a status line like "Searching..." or "Generating" while its
+  // AI answer is still being researched/written - a "not finished yet"
+  // signal, never an answer. Only a line that IS such a status counts: the
+  // words alone turn up all over an ordinary results page ("loading
+  // equipment", "searching for suppliers", a hidden "Loading..." in some
+  // widget), and matching them anywhere made the page look busy forever, so a
+  // search with no AI answer waited out its full 2-minute limit - twice.
+  const STILL_GENERATING_LINE_RE =
+    /^[ \t]*(thinking(?: a little longer)?|searching(?: the web)?|generating(?: an? (?:ai )?(?:overview|response|answer))?|loading)[ \t]*(?:\.{3}|…)?[ \t]*$/im;
   function isStillGenerating(text) {
-    return /\b(thinking(?:\s+a\s+little\s+longer)?|searching|generating|loading)\b/i.test(text || "");
+    return STILL_GENERATING_LINE_RE.test(text || "");
+  }
+
+  // Google's AI answer panel announces itself with this heading. Its absence
+  // (with no parsed answer either) is how a plain results page - no AI
+  // answer coming - is told apart from one still being written.
+  function hasAiAnswerSign(text) {
+    return /\bAI Overview\b/.test(text || "");
   }
 
   // --- Parsing the answer ---
@@ -439,6 +461,8 @@
   //               so a fast answer is never made to wait.
   //   "settled" - the page went quiet for quietMsFn(text) and isn't showing a
   //               "Searching..." indicator: as complete as it's going to get.
+  //   "no_ai"   - NO_AI_ANSWER_MS passed and noAnswerFn(text) says the page
+  //               shows no sign of an AI answer at all.
   //   "error"   - Google itself reported a failure.
   //   "blocked" - a CAPTCHA appeared mid-wait.
   //   "nudged"  - background.js asked for an immediate report (REPORT_NOW).
@@ -450,8 +474,9 @@
   // it is what actually notices the answer arriving. The interval below is
   // only a coarse backstop for the give-up paths, where being late costs
   // nothing.
-  function waitForAnswer(readyFn, quietMsFn, maxMs) {
+  function waitForAnswer(readyFn, quietMsFn, noAnswerFn, maxMs) {
     return new Promise((resolve) => {
+      const startedAt = Date.now();
       let settled = false;
       let lastLength = -1;
       let lastChangeAt = Date.now();
@@ -474,6 +499,7 @@
         const text = pageText();
         if (/something went wrong/i.test(text)) return finish("error");
         if (readyFn(text)) return finish("ready");
+        if (Date.now() - startedAt >= NO_AI_ANSWER_MS && noAnswerFn(text)) return finish("no_ai");
         if (text.length !== lastLength) {
           lastLength = text.length;
           lastChangeAt = Date.now();
@@ -587,7 +613,8 @@
       if (answered === n) return COMPLETE_QUIET_MS;
       return answered > 0 ? PARTIAL_QUIET_MS : ANSWER_QUIET_MS;
     };
-    let outcome = await waitForAnswer(readyFn, quietMsFn, waitMs);
+    const noAnswerFn = (text) => !hasAiAnswerSign(text) && answeredCount(parseAnswer(text, n), n) === 0;
+    let outcome = await waitForAnswer(readyFn, quietMsFn, noAnswerFn, waitMs);
 
     // A CAPTCHA that appeared mid-wait: hand it to a human, then give the
     // answer another full wait if it clears, rather than throwing the batch
@@ -598,7 +625,7 @@
         reportAllBlocked(items, batchToken);
         return;
       }
-      outcome = await waitForAnswer(readyFn, quietMsFn, waitMs);
+      outcome = await waitForAnswer(readyFn, quietMsFn, noAnswerFn, waitMs);
     }
 
     expandCollapsedAnswer();
@@ -650,16 +677,23 @@
       waitedMs: Date.now() - started,
       answered,
       endLineSeen: parsed.ended,
+      aiAnswerOnPage: hasAiAnswerSign(answerText),
       pageTextLength: answerText.length,
       results,
     });
-    chrome.runtime.sendMessage({ type: "RESULT", batchToken, results });
+    // "Google showed no AI answer at all" is not a sign that anything is
+    // broken - the page loaded fine - so background.js doesn't count it
+    // towards pausing the run (see emptyStreakPatch). Decided from the page
+    // itself, not from which exit ended the wait: a static page with no AI
+    // panel usually goes quiet (12s) before NO_AI_ANSWER_MS (15s) is reached.
+    const noAiAnswer = answered === 0 && !hasAiAnswerSign(answerText);
+    chrome.runtime.sendMessage({ type: "RESULT", batchToken, results, noAiAnswer });
   }
 
   // Exposed for the offline parser tests only (see tests/). In the extension
   // this script is never loaded as a module, so this branch never runs.
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { parseAnswer, parseBlock, answeredCount };
+    module.exports = { parseAnswer, parseBlock, answeredCount, waitForAnswer, isStillGenerating, hasAiAnswerSign, runBatch };
     return;
   }
 

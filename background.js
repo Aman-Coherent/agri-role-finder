@@ -1062,10 +1062,14 @@ function workerIndexForTab(engine, tabId) {
 
 // The engine patch for one more batch that came back with nothing at all
 // (or never came back). Several in a row means something is wrong for every
-// company, not just these - the network is down, Google stopped showing AI
-// answers for this query, or its page changed - so the run pauses instead
-// of quietly working through the rest of the list marking everything
-// not_found. `answered` resets the streak.
+// company, not just these - the network is down, or Google's page changed
+// so nothing can be read - so the run pauses instead of quietly working
+// through the rest of the list marking everything not_found. `answered`
+// resets the streak.
+//
+// A results page that loaded fine but simply had no AI answer (content.js
+// reports noAiAnswer) does NOT count: nothing is broken, Google just didn't
+// answer that search, and the run should move straight on - see handleResult.
 function emptyStreakPatch(e, answered) {
   if (answered) return { emptyStreak: 0 };
   const emptyStreak = (e.emptyStreak || 0) + 1;
@@ -1488,7 +1492,8 @@ async function handleResult(rawMessage, tabId) {
     if (workers[workerIndex] && workers[workerIndex].batchToken === claimedBatchToken) {
       workers[workerIndex] = { ...workers[workerIndex], currentItemIds: [], batchToken: null, searchUrl: null };
     }
-    const streak = anyBlocked ? {} : emptyStreakPatch(e, anyAnswered);
+    const neutral = anyBlocked || (!anyAnswered && rawMessage.noAiAnswer === true);
+    const streak = neutral ? {} : emptyStreakPatch(e, anyAnswered);
     const wasCaptchaTab = e.captchaTabIds.includes(tabId);
     if (!wasCaptchaTab) return { workers, ...streak };
     const captchaTabIds = e.captchaTabIds.filter((id) => id !== tabId);
