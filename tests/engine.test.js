@@ -28,6 +28,9 @@ function makeHarness() {
   const tabs = new Map();
   const activated = [];
   const navigations = [];
+  // Stands in for Google redirecting a request before the page commits
+  // (e.g. a blocked search going straight to its CAPTCHA page).
+  let redirect = null;
   let nextTab = 1;
   const fire = (list, ...args) => list.forEach((f) => f(...args));
 
@@ -64,7 +67,7 @@ function makeHarness() {
       update: async (id, p) => {
         if (!tabs.has(id)) throw new Error("no tab");
         if (p.active) activated.push(id);
-        if (p.url) navigate(id, p.url);
+        if (p.url) navigate(id, (redirect && redirect(p.url)) || p.url);
         return { ...tabs.get(id) };
       },
       remove: async (id) => {
@@ -114,6 +117,9 @@ function makeHarness() {
 
   return {
     send, engine, project, byName, workerTab, tabs, alarms, activated, navigate, navigations,
+    setRedirect(fn) {
+      redirect = fn;
+    },
     // The page in a tab finishing loading (or being refreshed) without its
     // URL changing.
     async pageLoaded(id) {
@@ -244,6 +250,54 @@ test("Google's CAPTCHA page pauses the run and brings the tab forward; solving i
   for (const n of ["A", "B", "C"]) assert.strictEqual(h.byName(n).status, "found", n);
   await h.nextBatch();
   assert.deepStrictEqual(await h.answer(answers()), ["D"], "and the run carries on");
+});
+
+test("a CAPTCHA page too long to show (Google's 400 error) is swapped for a short search's CAPTCHA, then the real search runs", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(["A", "B", "C", "D"]));
+  const tab = h.workerTab();
+  const searchUrl = tab.url;
+  const landing = "https://www.google.com/search?q=agriculture%20companies&hl=en&pws=0";
+  const sorryFor = (u) => `https://www.google.com/sorry/index?continue=${encodeURIComponent(u)}&q=token`;
+
+  // While blocked, Google sends every search to its CAPTCHA page.
+  h.setRedirect((u) => (u.startsWith(SEARCH) ? sorryFor(u) : null));
+  const longSorry = sorryFor(searchUrl);
+  assert.ok(longSorry.length > 4000, `the real CAPTCHA page address is ${longSorry.length} characters`);
+  h.navigate(tab.id, longSorry); // what the screenshot showed
+  await settle();
+
+  assert.strictEqual(h.engine().isPaused, true);
+  assert.ok(h.activated.includes(tab.id), "the tab is brought to the front");
+  assert.strictEqual(h.tabs.get(tab.id).url, sorryFor(landing), "now on the SHORT search's CAPTCHA page, which works");
+  await h.pageLoaded(tab.id);
+  assert.strictEqual(h.tabs.get(tab.id).url, sorryFor(landing), "and left there for you to solve");
+
+  // Solved: Google is happy again and sends the tab back to the short search.
+  h.setRedirect(null);
+  const contentOnLanding = await h.send({ type: "GET_CURRENT" }, { tab: { id: tab.id, url: landing } });
+  assert.strictEqual(contentOnLanding, null, "the stand-in search is never read as an answer");
+  h.navigate(tab.id, landing);
+  await settle();
+  assert.strictEqual(h.engine().isPaused, false, "the run resumes");
+  assert.strictEqual(h.tabs.get(tab.id).url, searchUrl, "and the tab goes on to the batch's real search");
+
+  await h.answer(answers());
+  for (const n of ["A", "B", "C"]) assert.strictEqual(h.byName(n).status, "found", n);
+});
+
+test("if Google keeps refusing even the short search, the tab is not bounced around forever", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(["A"]));
+  const tab = h.workerTab();
+  const sorryFor = (u) => `https://www.google.com/sorry/index?continue=${encodeURIComponent(u)}&q=token`;
+  // Every search, short or long, comes back as a too-long CAPTCHA page.
+  const longTail = "x".repeat(5000);
+  h.setRedirect((u) => (u.startsWith(SEARCH) ? sorryFor(u + longTail) : null));
+  h.navigate(tab.id, sorryFor(tab.url + longTail));
+  await settle();
+  assert.ok(h.navigations.length < 12, `navigated ${h.navigations.length} times`);
+  assert.strictEqual(h.engine().isPaused, true, "still waiting for a person");
 });
 
 test("solved, but Google lands on its home page: the tab is sent back to the same search", async () => {

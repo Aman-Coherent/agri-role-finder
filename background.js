@@ -118,9 +118,22 @@ const MAX_ATTEMPTS = 2;
 // This many batches in a row with no answer at all pauses the run - see
 // emptyStreakPatch.
 const EMPTY_STREAK_LIMIT = 4;
-// How many times one batch's tab may be sent back to its search after a
-// CAPTCHA landed it elsewhere - see handleWorkerTabUrl.
-const MAX_RENAVIGATIONS = 2;
+// How many times the extension may move one batch's tab around while a
+// CAPTCHA is being dealt with - see renavigateWorkerTab. The normal long-
+// query CAPTCHA takes 2 (to the short search, then back to the real one);
+// the rest is room for Google's redirects landing somewhere unexpected.
+const MAX_RENAVIGATIONS = 4;
+
+// The short search a worker tab is sent to when Google's CAPTCHA page for
+// the real (very long) query can't even display - see handleWorkerTabUrl.
+// Any short query works; this one is simply harmless and recognisable.
+const CAPTCHA_LANDING_QUERY = "agriculture companies";
+const CAPTCHA_LANDING_URL = `https://www.google.com/search?q=${encodeURIComponent(CAPTCHA_LANDING_QUERY)}&hl=en&pws=0`;
+// Longer than this, Google's CAPTCHA page fails with "400. That's an error"
+// instead of showing a CAPTCHA, because it carries the whole blocked search
+// in its own address. A short query's CAPTCHA page is a few hundred
+// characters; this extension's real one is tens of thousands.
+const MAX_WORKING_SORRY_URL_LEN = 4000;
 
 // "found" here means "classified into at least one entity" - see
 // sanitizeResultEntry. "missing" is never stored: it is content.js saying
@@ -466,6 +479,17 @@ function isGoogleSearchUrl(url) {
 // loads at all. See handleWorkerTabUrl.
 function isSorryUrl(url) {
   return /^https:\/\/([^/]*\.)?google\.[a-z.]+\/sorry\//i.test(url || "");
+}
+
+// The short stand-in search used to get a working CAPTCHA (see
+// CAPTCHA_LANDING_URL) - never a batch's own search.
+function isCaptchaLandingUrl(url) {
+  if (!isGoogleSearchUrl(url)) return false;
+  try {
+    return new URL(url).searchParams.get("q") === CAPTCHA_LANDING_QUERY;
+  } catch {
+    return false;
+  }
 }
 
 // Google's cookie-consent page ("Before you continue"), shown to some regions
@@ -1079,6 +1103,28 @@ async function handleCaptchaDetected(rawMessage, tabId) {
   await markNeedsHuman(workerIndex, tabId, "captcha");
 }
 
+// Sends a worker's tab somewhere, at most MAX_RENAVIGATIONS times per batch
+// - a hard stop against any redirect loop with Google that the reasoning in
+// handleWorkerTabUrl missed. Returns whether it did.
+async function renavigateWorkerTab(workerIndex, batchToken, tabId, url, why) {
+  let allowed = false;
+  await mutateEngine((e) => {
+    const w = e.workers[workerIndex];
+    if (!w || w.batchToken !== batchToken || (w.renavigations || 0) >= MAX_RENAVIGATIONS) return {};
+    allowed = true;
+    const workers = e.workers.slice();
+    workers[workerIndex] = { ...w, renavigations: (w.renavigations || 0) + 1 };
+    return { workers };
+  });
+  if (!allowed) {
+    console.warn(`[AgriRoleFinder] worker ${workerIndex}: not re-navigating again (${why}) - limit reached for this batch`);
+    return false;
+  }
+  console.warn(`[AgriRoleFinder] worker ${workerIndex}: ${why}`);
+  await chrome.tabs.update(tabId, { url });
+  return true;
+}
+
 // Every URL change of a worker tab, straight from Chrome. This is how a
 // CAPTCHA is noticed at all in the usual case: Google answers a search it
 // considers suspicious by REDIRECTING to https://www.google.com/sorry/...,
@@ -1088,6 +1134,19 @@ async function handleCaptchaDetected(rawMessage, tabId) {
 // Only a URL change (changeInfo.url) can mean "solved" - the redirect back
 // to /search. A "finished loading" event for the page the tab is already on
 // never does, or the very page that showed an inline CAPTCHA would clear it.
+//
+// THE LONG-QUERY PROBLEM. Google's CAPTCHA page carries the whole blocked
+// search in its own address (sorry/index?continue=<the search URL>), so it
+// can send you back after. This extension's query is ~9K characters - the
+// entity list rides along - and inside that continue= link it grows past
+// what the CAPTCHA page accepts: instead of a CAPTCHA it shows "400. That's
+// an error. Your client has issued a malformed or illegal request", with
+// nothing to solve. (The sibling ai-mode-scraper never hits this: its query
+// is a few hundred characters.) So a CAPTCHA page with a long address is
+// swapped for a short search (CAPTCHA_LANDING_URL): Google shows a normal,
+// solvable CAPTCHA for that, and once it is solved - which unblocks this
+// browser for Google, not just that one search - the tab is sent on to the
+// batch's real search.
 async function handleWorkerTabUrl(tabId, url, isUrlChange) {
   const engine = await getEngine();
   if (!engine.activeProjectId) return;
@@ -1099,6 +1158,12 @@ async function handleWorkerTabUrl(tabId, url, isUrlChange) {
 
   if (isSorryUrl(url)) {
     if (!waiting) await markNeedsHuman(workerIndex, tabId, "captcha");
+    if (isUrlChange && url.length > MAX_WORKING_SORRY_URL_LEN) {
+      await renavigateWorkerTab(
+        workerIndex, worker.batchToken, tabId, CAPTCHA_LANDING_URL,
+        "CAPTCHA page with a too-long address (Google shows a 400 error there) - opening a short search so Google shows a real CAPTCHA"
+      );
+    }
     return;
   }
   if (isConsentUrl(url)) {
@@ -1108,31 +1173,25 @@ async function handleWorkerTabUrl(tabId, url, isUrlChange) {
   if (!waiting) return;
   if (isUrlChange && isGoogleSearchUrl(url)) {
     await handleHumanCleared(workerIndex, tabId);
+    // Solved on the short stand-in search: now run the real one.
+    if (isCaptchaLandingUrl(url) && worker.searchUrl) {
+      await renavigateWorkerTab(workerIndex, worker.batchToken, tabId, worker.searchUrl, "CAPTCHA solved - opening this batch's search");
+    }
     return;
   }
-  // Solved, but Google's redirect landed somewhere other than the results
-  // page (its home page, say - the continue link can get lost on a query
-  // this long). Send the tab back to this batch's own search; arriving there
-  // is what clears the pause.
+  // Solved, but Google's redirect landed somewhere other than a results page
+  // (its home page, say). Send the tab back to this batch's own search;
+  // arriving there is what clears the pause.
   //
   // Never for a page that already IS a search: an inline CAPTCHA sits on the
   // results page, and that page finishing loading (or you refreshing it)
   // would otherwise re-open the search, finish loading, re-open it again -
-  // an endless reload loop. And at most MAX_RENAVIGATIONS per batch, as a
-  // hard stop against any loop this reasoning missed.
+  // an endless reload loop.
   if (!isUrlChange && isGoogleUrl(url) && !isGoogleSearchUrl(url) && worker.searchUrl) {
-    let allowed = false;
-    await mutateEngine((e) => {
-      const w = e.workers[workerIndex];
-      if (!w || w.batchToken !== worker.batchToken || (w.renavigations || 0) >= MAX_RENAVIGATIONS) return {};
-      allowed = true;
-      const workers = e.workers.slice();
-      workers[workerIndex] = { ...w, renavigations: (w.renavigations || 0) + 1 };
-      return { workers };
-    });
-    if (!allowed) return;
-    console.warn(`[AgriRoleFinder] worker ${workerIndex}: landed on ${url.slice(0, 60)} after the CAPTCHA - re-opening the search`);
-    await chrome.tabs.update(tabId, { url: worker.searchUrl });
+    await renavigateWorkerTab(
+      workerIndex, worker.batchToken, tabId, worker.searchUrl,
+      `landed on ${url.slice(0, 60)} after the CAPTCHA - re-opening the search`
+    );
   }
 }
 
@@ -1378,6 +1437,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const worker = engine.workers[workerIndex];
         if (!(worker.currentItemIds || []).length) {
           debug(`GET_CURRENT from worker ${workerIndex} (tab ${sender.tab.id}): nothing claimed right now`);
+          sendResponse(null);
+          return;
+        }
+        // The short stand-in search used to get a working CAPTCHA has nothing
+        // to do with this batch - reading it as the answer would record every
+        // company as not found. The tab moves on to the real search next.
+        if (isCaptchaLandingUrl(sender.tab.url)) {
+          debug(`GET_CURRENT from worker ${workerIndex}: on the CAPTCHA stand-in search - leaving that page alone`);
           sendResponse(null);
           return;
         }

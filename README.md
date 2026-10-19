@@ -70,7 +70,8 @@ long run.
 
 | Situation | What the extension does |
 |---|---|
-| **Google shows its CAPTCHA page** ("unusual traffic") | Pauses the whole run, brings that tab to the front, and waits. Once you solve it, Google sends the tab back to the search, the search runs, and the whole run resumes by itself. If Google lands the tab somewhere else (e.g. its home page), the extension re-opens the search itself, at most twice. |
+| **Google shows its CAPTCHA page** ("unusual traffic") | Pauses the whole run, brings that tab to the front, and waits. Once you solve it, Google sends the tab back to the search, the search runs, and the whole run resumes by itself. If Google lands the tab somewhere else (e.g. its home page), the extension re-opens the search itself. |
+| **CAPTCHA page shows "400. That's an error"** instead of a CAPTCHA | This happens because the question is so long: Google's CAPTCHA page carries the whole search in its own address, and ours is too long for it. The extension sends the tab to a short search (`agriculture companies`), where Google shows a normal CAPTCHA. After you solve it, the tab goes on to the real search by itself. The short search is never read as an answer. |
 | **CAPTCHA right on the results page** | Same: pauses, waits for you, resumes. |
 | **Google's cookie-consent page** ("Before you continue") | Same as a CAPTCHA: answer it once in that tab and the run continues. |
 | **CAPTCHA not solved within 10 minutes** | Those companies are marked blocked and the run stays paused. **Resume** searches them again. |
