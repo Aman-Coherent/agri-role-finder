@@ -548,10 +548,13 @@ function rolesCell(roles) {
   return roles.map((r) => (r.code ? `${r.name} (${r.code})` : r.name)).join("; ");
 }
 
-// From the role codes, via the mapping in taxonomy.js. Roles with no code,
-// and G (Grower) roles, contribute nothing - see BUSINESS_TYPE_BY_CODE.
+// Every individual business type of the roles in this row, each once.
+// Already decided per role when the result came in (resolveBusinessTypes in
+// taxonomy.js), so a company split across both files shows, in each file,
+// only the types of the roles in that row.
 function businessTypeCell(roles) {
-  return ARF_TAXONOMY.businessTypesFor(roles.map((r) => r.code).filter(Boolean)).join("; ");
+  const types = roles.flatMap((r) => r.types || []);
+  return types.filter((t, i) => types.indexOf(t) === i).join("; ");
 }
 
 // One row per company + entity ("Option B"), split ROLE BY ROLE between the
@@ -598,7 +601,6 @@ async function exportClassified(which, filename) {
         item.description || "",
         part.entity,
         rolesCell(part.roles),
-        // New roles have no code, so this is always blank in the new file.
         businessTypeCell(part.roles),
       ]);
     }

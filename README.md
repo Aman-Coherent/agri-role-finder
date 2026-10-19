@@ -5,7 +5,7 @@ Takes a CSV of agriculture companies and, for each one, finds:
 - **description**: 2-3 sentences on what the company does
 - **entity**: which sector(s) it belongs to, e.g. *Seeds & biologicals*
 - **roles**: what it does in that sector, e.g. *Seed Distributor (D)*
-- **business_type**: worked out from the role codes, e.g. *Distributor/Wholesaler/Trader/Supplier*
+- **business_type**: the exact type for each role, e.g. *Distributor* or *Exporter* (never a group like *Exporter/Importer*)
 
 Entities and roles are picked from a fixed list (49 entities, 240 roles) kept
 in [taxonomy.js](taxonomy.js). If a company does something the list doesn't
@@ -50,7 +50,7 @@ long run.
    ```
    COMPANY 1
    DESCRIPTION: ...
-   ENTITY: Seeds & biologicals | ROLES: Seed Distributor; Seed Importer / Exporter
+   ENTITY: Seeds & biologicals | ROLES: Seed Distributor [Distributor]; Seed Importer / Exporter [Exporter]
    END OF ANSWERS
    ```
 3. It reads the answer. Each `COMPANY <number>` block is matched to its
@@ -58,8 +58,9 @@ long run.
    the right rows.
 4. **The extension itself checks each entity and role against the list.** It
    ignores small differences like capitals, "&" vs "and", or a code the AI
-   copied, and always writes the list's own spelling. It adds the code and
-   business type from the list, never from the AI.
+   copied, and always writes the list's own spelling. The code comes from
+   the list, never from the AI, and the AI's business type is only kept if
+   that code allows it (see **business_type** below).
 5. It waits a random 8-15 seconds, then does the next 3.
 6. **CAPTCHA**: the run pauses and brings that tab to the front. You solve
    it, and the run continues by itself. It never solves one for you. If
@@ -73,7 +74,7 @@ One row per **company + entity**. Roles inside a cell are separated by `;`.
 | File | What's in it |
 |---|---|
 | `on_list_results.csv` | Entities, and roles, that are **on the list** |
-| `new_results.csv` | Entities or roles **not on the list** (always blank business_type) |
+| `new_results.csv` | Entities or roles **not on the list** |
 | `not_found.csv` | No usable answer. A description may still be there if the AI described the company but gave no entity |
 | `needs_review.csv` | Blocked by a CAPTCHA nobody solved |
 
@@ -82,20 +83,31 @@ list role and one new role, the list role goes to `on_list_results.csv` and
 the new role to `new_results.csv`, both under *Fertilizers*. So one company
 can appear in both files.
 
-**business_type** is worked out from the role codes:
+### business_type
 
-| Code | business_type |
-|---|---|
-| M | Manufacturer |
-| 3PM | Third Party Manufacturer |
-| EI | Exporter/Importer |
-| D | Distributor/Wholesaler/Trader/Supplier |
-| R | Retailer |
-| SP | Service Provider |
-| B | Brand |
-| F | Formulator/CRO |
-| EI+D | Exporter/Importer; Distributor/Wholesaler/Trader/Supplier |
-| G, or no code | *(blank)* |
+Always **individual** types, never a group label like "Exporter/Importer".
+Only these 13 can appear:
+
+> Manufacturer, Third Party Manufacturer, Exporter, Importer, Distributor,
+> Wholesaler, Trader, Supplier, Retailer, Service Provider, Brand,
+> Formulator, CRO
+
+The AI writes a type after each role, e.g. `Seed Importer / Exporter [Exporter]`,
+and the extension checks it against **that role's code**:
+
+| Role's code | Allowed types | If the AI gave no valid type |
+|---|---|---|
+| M / 3PM / R / SP / B | just that one (Manufacturer, Third Party Manufacturer, Retailer, Service Provider, Brand) | the code decides; the AI isn't needed |
+| EI | Exporter, Importer | the role's name decides if it names one ("Merchant Exporter" → Exporter), otherwise **Exporter** |
+| D | Distributor, Wholesaler, Trader, Supplier | same, otherwise **Distributor** |
+| F | Formulator, CRO | same, otherwise **Formulator** |
+| EI+D | one from each of the EI and D groups | same, for each group |
+| G, or no code | *(blank)* | *(blank)* |
+| new role (not on the list) | any of the 13 | *(blank)* |
+
+A type the code doesn't allow is dropped. An EI role can only ever be
+Exporter or Importer, even if the AI wrote "Trader". Each row shows the
+types of the roles in that row, separated by `;`.
 
 **Retry not-found rows** re-queues every not-found company for another try
 (stop the project first).

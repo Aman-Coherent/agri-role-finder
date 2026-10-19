@@ -120,7 +120,7 @@ const ALLOWED_STATUSES = new Set(["found", "not_found", "blocked"]);
 // bloat every stored item (chrome.storage is shared by every project, and a
 // queue can run to thousands of rows).
 const MAX_DESCRIPTION_LEN = 1200;
-const MAX_NAME_LEN = 150;
+const MAX_NAME_LEN = 200; // a role name plus its "[business type]" suffix
 const MAX_ENTITIES_PER_COMPANY = 12;
 const MAX_ROLES_PER_ENTITY = 15;
 
@@ -221,8 +221,8 @@ function makeProject(name, companies, columns, delayMinSec, delayMaxSec, concurr
       original: c.original && typeof c.original === "object" ? c.original : {},
       status: "pending",
       description: null,
-      // [{ entity, entityInList, roles: [{ name, code, inList }] }] - see
-      // ARF_TAXONOMY.classify in taxonomy.js.
+      // [{ entity, entityInList, roles: [{ name, code, inList, types }] }] -
+      // see ARF_TAXONOMY.classify in taxonomy.js.
       classifications: [],
     })),
     delayMinSec: delayMinSec || 8,
@@ -356,6 +356,11 @@ function describeCompany(item) {
 //   - "END OF ANSWERS" lets content.js stop waiting the moment the AI is done,
 //     instead of waiting out a silence to be sure the last company's final
 //     ENTITY line isn't still on its way.
+//   - Each role carries its business type in [square brackets]. Square, not
+//     round, because several role names already contain round brackets
+//     ("Micro-irrigation (Drip/Sprinkler) Manufacturer"). content.js splits
+//     roles on ";" outside the brackets, and taxonomy.js checks the types
+//     against the role's code (resolveBusinessTypes).
 //   - "Write NONE instead of guessing" is the main defence against a
 //     generative answer inventing plausible-sounding activities.
 function buildPrompt(items) {
@@ -375,14 +380,19 @@ function buildPrompt(items) {
     `actually performs. Copy entity and role names EXACTLY as written in the list. ` +
     `A company can have several entities and several roles.\n` +
     `(c) Only if the company clearly does something that no entity or role in the ` +
-    `list covers, write your own short, plain name for that entity or role instead.\n\n` +
+    `list covers, write your own short, plain name for that entity or role instead.\n` +
+    `(d) After each role, in square brackets, write the business type the company ` +
+    `actually is for that role, using ONLY these exact words: ` +
+    `${ARF_TAXONOMY.BUSINESS_TYPES.join(", ")}. Pick the specific one - for example ` +
+    `Exporter, not Exporter/Importer; Distributor, not Distributor/Wholesaler. If it ` +
+    `is more than one, separate them with commas inside the brackets.\n\n` +
     `LIST - each line is an entity, a colon, then that entity's roles separated by semicolons:\n` +
     `${ARF_TAXONOMY.promptList()}\n\n` +
     `Reply in exactly this format and nothing else - no greeting, no explanation, ` +
     `no markdown, no tables:\n` +
     `COMPANY <number>\n` +
     `DESCRIPTION: <2-3 sentences on one line>\n` +
-    `ENTITY: <entity name> | ROLES: <role>; <role>\n` +
+    `ENTITY: <entity name> | ROLES: <role> [<business type>]; <role> [<business type>]\n` +
     `Write one ENTITY line for each entity the company belongs to. Use the same ` +
     `company numbers as above, keep the same order, and do not skip any company. ` +
     `After the last company, write one final line: END OF ANSWERS\n` +

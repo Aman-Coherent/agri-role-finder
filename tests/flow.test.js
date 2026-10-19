@@ -42,6 +42,8 @@ test("the question names the website when there is one, and the location otherwi
   assert.match(p, /1\) "A" - website: a\.com - location: Pune, MH, India/);
   assert.match(p, /2\) "B" - location: Nashik, India/);
   assert.match(p, /Seeds & biologicals: Seed Company \/ Seed Producer; Seed Production Organiser/);
+  assert.match(p, /ROLES: <role> \[<business type>\]/);
+  assert.match(p, /Manufacturer, Third Party Manufacturer, Exporter, Importer, Distributor, Wholesaler, Trader, Supplier, Retailer, Service Provider, Brand, Formulator, CRO\./);
   assert.ok(encodeURIComponent(p).length < 20000, "URL stays within the length Google was checked to accept");
 });
 
@@ -51,7 +53,7 @@ test("background decides on-list vs new itself, and status follows what survives
     status: "found",
     description: "Makes seeds.",
     entities: [
-      { entity: "seeds and biologicals", roles: ["Seed Distributor", "Seed Kiosk Operator"] },
+      { entity: "seeds and biologicals", roles: ["Seed Distributor [Wholesaler]", "Seed Kiosk Operator [Retailer]"] },
       { entity: "Agri Insurance", roles: ["Crop Insurance; Advisory"] },
     ],
   });
@@ -60,12 +62,12 @@ test("background decides on-list vs new itself, and status follows what survives
     {
       entity: "Seeds & biologicals", entityInList: true,
       roles: [
-        { name: "Seed Distributor", code: "D", inList: true },
-        { name: "Seed Kiosk Operator", code: null, inList: false },
+        { name: "Seed Distributor", code: "D", inList: true, types: ["Wholesaler"] },
+        { name: "Seed Kiosk Operator", code: null, inList: false, types: ["Retailer"] },
       ],
     },
     // A ";" inside one role name would read as two roles in the export.
-    { entity: "Agri Insurance", entityInList: false, roles: [{ name: "Crop Insurance, Advisory", code: null, inList: false }] },
+    { entity: "Agri Insurance", entityInList: false, roles: [{ name: "Crop Insurance, Advisory", code: null, inList: false, types: [] }] },
   ]);
 
   const describedOnly = bg.sanitizeResultEntry({ itemId: "r1", status: "found", description: "A firm.", entities: [] });
@@ -82,10 +84,11 @@ test("export rows split role by role between the two files, with codes and busin
       itemId: "r0",
       status: "found",
       entities: [
-        { entity: "Fertilizers", roles: ["Fertilizer Manufacturer", "Fertilizer Dealer / Retailer", "Bio-stimulant Trader"] },
+        { entity: "Fertilizers", roles: ["Fertilizer Manufacturer [Manufacturer]", "Fertilizer Dealer / Retailer", "Bio-stimulant Trader [Trader]"] },
         { entity: "Innovative agri solutions", roles: ["Agri-innovation Importer / Distributor"] },
         { entity: "Crop farming", roles: ["Crop Farmer / Grower"] },
-        { entity: "Agri Insurance", roles: ["Crop Insurance Provider"] },
+        { entity: "Agri Insurance", roles: ["Crop Insurance Provider [Service Provider]"] },
+        { entity: "Seeds & biologicals", roles: ["Seed Importer / Exporter [Exporter]", "Seed Distributor [Trader]"] },
       ],
     }).classifications,
   };
@@ -93,13 +96,17 @@ test("export rows split role by role between the two files, with codes and busin
   const rows = (parts) => parts.map((p) => [p.entity, popup.rolesCell(p.roles), popup.businessTypeCell(p.roles)]);
   assert.deepStrictEqual(plain(rows(onList)), [
     ["Fertilizers", "Fertilizer Manufacturer (M); Fertilizer Dealer / Retailer (R)", "Manufacturer; Retailer"],
-    ["Innovative agri solutions", "Agri-innovation Importer / Distributor (EI+D)", "Exporter/Importer; Distributor/Wholesaler/Trader/Supplier"],
+    // No type given: the role name points to Importer and Distributor.
+    ["Innovative agri solutions", "Agri-innovation Importer / Distributor (EI+D)", "Importer; Distributor"],
     // G has no business type.
     ["Crop farming", "Crop Farmer / Grower (G)", ""],
+    // Individual types, one per role, each once.
+    ["Seeds & biologicals", "Seed Importer / Exporter (EI); Seed Distributor (D)", "Exporter; Trader"],
   ]);
   assert.deepStrictEqual(plain(rows(fresh)), [
-    ["Fertilizers", "Bio-stimulant Trader", ""],
-    ["Agri Insurance", "Crop Insurance Provider", ""],
+    // New roles keep the AI pick; each row shows only its own roles types.
+    ["Fertilizers", "Bio-stimulant Trader", "Trader"],
+    ["Agri Insurance", "Crop Insurance Provider", "Service Provider"],
   ]);
 });
 

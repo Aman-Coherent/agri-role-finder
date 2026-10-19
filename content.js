@@ -245,12 +245,28 @@
   const ROLES_SPLIT_RE = /\|?\s*\**\s*\bROLES?\s*\**\s*:/i;
   const ANY_LABEL_RE = new RegExp(`${LABEL_PREFIX}(COMPANY\\s*#?\\s*\\d|DESCRIPTION\\s*\\**\\s*:|ENTITY\\s*\\**\\s*:|ROLES?\\s*\\**\\s*:|END\\s+OF\\s+ANSWERS)`, "i");
 
+  // Roles are separated by ";", but only OUTSIDE square brackets: each role
+  // carries its business type(s) as "Seed Distributor [Distributor]", and an
+  // AI that separates several types with ";" instead of "," must not have
+  // its role cut in half. The "[...]" itself is kept and passed on as-is -
+  // taxonomy.js reads it (splitRoleText).
   function splitRoles(raw) {
     if (!raw || isTemplateValue(raw)) return [];
-    return raw
-      .split(/;/)
-      .map(clean)
-      .filter((r) => r && !isNoneValue(r) && !isTemplateValue(r));
+    const parts = [];
+    let depth = 0;
+    let current = "";
+    for (const ch of raw) {
+      if (ch === "[") depth++;
+      else if (ch === "]") depth = Math.max(0, depth - 1);
+      if (ch === ";" && depth === 0) {
+        parts.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    parts.push(current);
+    return parts.map(clean).filter((r) => r && !isNoneValue(r) && !isTemplateValue(r));
   }
 
   // Reads one company's block (the text between its COMPANY line and the

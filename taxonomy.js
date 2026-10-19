@@ -4,9 +4,9 @@
  * "on the list" or "new".
  *
  * THIS IS THE ONE FILE TO EDIT when the list changes. Each role is
- * [name, code]. The code drives the business_type column (see
- * BUSINESS_TYPE_BY_CODE); a role with no code (null) gets a blank
- * business_type. Names are matched forgivingly (case, "&" vs "and",
+ * [name, code]. The code limits which business types that role can have
+ * (see BUSINESS_TYPE_GROUPS_BY_CODE); a role with no code (null) gets a
+ * blank business_type. Names are matched forgivingly (case, "&" vs "and",
  * punctuation, a trailing "(M)"), but what gets exported is always the exact
  * name written here, never the AI's spelling of it.
  *
@@ -16,19 +16,46 @@
  * scripts).
  */
 
+// The only values the business_type column can ever hold. Always single
+// types, never a grouped label like "Exporter/Importer": the AI is asked
+// which one the company actually is.
+const BUSINESS_TYPES = [
+  "Manufacturer", "Third Party Manufacturer", "Exporter", "Importer", "Distributor", "Wholesaler",
+  "Trader", "Supplier", "Retailer", "Service Provider", "Brand", "Formulator", "CRO",
+];
+
+// Which business types a role's code allows, as groups. A one-type group is
+// settled by the code alone; a several-type group needs the AI to say which
+// one. EI+D is two groups, so a role like "Agri-innovation Importer /
+// Distributor" can resolve to one type from each.
+//
 // G (Grower) is deliberately absent: the business-type dropdown this feeds
 // has no Grower option, so G roles export a blank business_type, the same as
 // roles with no code at all.
-const BUSINESS_TYPE_BY_CODE = {
-  M: ["Manufacturer"],
-  "3PM": ["Third Party Manufacturer"],
-  EI: ["Exporter/Importer"],
-  D: ["Distributor/Wholesaler/Trader/Supplier"],
-  R: ["Retailer"],
-  SP: ["Service Provider"],
-  B: ["Brand"],
-  F: ["Formulator/CRO"],
-  "EI+D": ["Exporter/Importer", "Distributor/Wholesaler/Trader/Supplier"],
+const BUSINESS_TYPE_GROUPS_BY_CODE = {
+  M: [["Manufacturer"]],
+  "3PM": [["Third Party Manufacturer"]],
+  EI: [["Exporter", "Importer"]],
+  D: [["Distributor", "Wholesaler", "Trader", "Supplier"]],
+  R: [["Retailer"]],
+  SP: [["Service Provider"]],
+  B: [["Brand"]],
+  F: [["Formulator", "CRO"]],
+  "EI+D": [["Exporter", "Importer"], ["Distributor", "Wholesaler", "Trader", "Supplier"]],
+};
+
+// Words in a role's own name that point at one type, used only when the AI
+// gave no valid type for an on-list role: "Merchant Exporter" is an
+// Exporter, "Stockist / Wholesaler" a Wholesaler.
+const BUSINESS_TYPE_NAME_HINTS = {
+  Exporter: /\bexport/i,
+  Importer: /\bimport/i,
+  Distributor: /\bdistribut/i,
+  Wholesaler: /\bwholesal/i,
+  Trader: /\btrad(?:er|ing)\b/i,
+  Supplier: /\bsuppl/i,
+  Formulator: /\bformulat/i,
+  CRO: /\bCRO\b/,
 };
 
 const TAXONOMY = [
@@ -633,19 +660,81 @@ function findRole(entity, rawName) {
   return (entity && ROLE_INDEX.get(entity).get(normalizeName(rawName))) || null;
 }
 
-function businessTypesFor(codes) {
-  const out = [];
-  for (const code of codes) {
-    for (const type of BUSINESS_TYPE_BY_CODE[code] || []) {
-      if (!out.includes(type)) out.push(type);
-    }
+// ---------------------------------------------------------------------------
+// Business types
+// ---------------------------------------------------------------------------
+
+const BUSINESS_TYPE_INDEX = new Map(BUSINESS_TYPES.map((t) => [normalizeName(t), t]));
+
+// One exact business type, or null. A grouped label the AI wrote anyway
+// ("Exporter/Importer") deliberately matches nothing: it doesn't say which
+// one, so it is treated the same as no answer.
+function findBusinessType(raw) {
+  const key = normalizeName(raw);
+  return BUSINESS_TYPE_INDEX.get(key) || BUSINESS_TYPE_INDEX.get(key.replace(/s$/, "")) || null;
+}
+
+// Inside the brackets the AI separates several types with commas; "&" and
+// "and" are accepted too. Not "/" - see findBusinessType.
+function splitTypes(raw) {
+  return String(raw || "")
+    .split(/\s*(?:,|;|&|\band\b)\s*/i)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+// The AI writes each role as "Seed Distributor [Distributor]". Splits that
+// into the role name and the raw type words. Round brackets are accepted
+// too, but only when everything inside them is a real business type -
+// otherwise "(Drip/Sprinkler)" or a role code like "(D)" would be mistaken
+// for one.
+function splitRoleText(raw) {
+  const text = String(raw || "").trim();
+  const square = text.match(/^(.*?)\s*\[([^\]]*)\]\s*$/);
+  if (square) return { name: square[1].trim(), typeWords: splitTypes(square[2]) };
+  const round = text.match(/^(.*?)\s*\(([^)]*)\)\s*$/);
+  if (round) {
+    const words = splitTypes(round[2]);
+    if (words.length && words.every((w) => findBusinessType(w))) return { name: round[1].trim(), typeWords: words };
   }
-  return out;
+  return { name: text, typeWords: [] };
+}
+
+function uniqueInOrder(values) {
+  return values.filter((v, i) => values.indexOf(v) === i);
+}
+
+// Decides a role's business type(s). The AI's answer is only ever a
+// suggestion checked against the role:
+//
+//   new role (not on the list) -> whatever the AI picked from BUSINESS_TYPES,
+//     or blank. There is no code to check it against.
+//   on-list role, G or no code -> always blank.
+//   on-list role with a code -> only types that code allows. A one-type code
+//     (M, 3PM, R, SP, B) is settled by the code alone. For a group (EI, D, F,
+//     EI+D) the AI's pick is used if it is in the group; if it gave none,
+//     each group falls back to the one type the role's own name points to,
+//     or else the group's first type (Distributor, Exporter, Formulator) -
+//     so the column always holds an individual type, never a group label.
+function resolveBusinessTypes(role, typeWords) {
+  const picked = uniqueInOrder(typeWords.map(findBusinessType).filter(Boolean));
+  if (!role) return picked;
+  const groups = BUSINESS_TYPE_GROUPS_BY_CODE[role[1]];
+  if (!groups) return [];
+  const allowed = groups.flat();
+  const valid = allowed.filter((t) => picked.includes(t));
+  if (valid.length) return valid;
+  return groups.map((group) => {
+    if (group.length === 1) return group[0];
+    const hinted = group.filter((t) => BUSINESS_TYPE_NAME_HINTS[t].test(role[0]));
+    return hinted.length === 1 ? hinted[0] : group[0];
+  });
 }
 
 // raw: [{ entity: "<AI's text>", roles: ["<AI's text>", ...] }, ...]
+// Each raw role may end in "[<business type>, ...]" - see splitRoleText.
 // Returns one entry per distinct entity, each role marked inList or not:
-//   [{ entity, entityInList, roles: [{ name, code, inList }] }]
+//   [{ entity, entityInList, roles: [{ name, code, inList, types }] }]
 // A role is only "on the list" if it is on THIS entity's list. Under a new
 // entity, every role is new by definition - there is no list to check it
 // against.
@@ -656,19 +745,27 @@ function classify(raw) {
     const entityName = listed ? listed.entity : String(r.entity || "").trim();
     if (!entityName) continue;
     const key = listed ? `list:${listed.entity}` : `new:${normalizeName(entityName)}`;
-    if (!byKey.has(key)) byKey.set(key, { entity: entityName, entityInList: !!listed, roles: [], _seen: new Set() });
+    if (!byKey.has(key)) byKey.set(key, { entity: entityName, entityInList: !!listed, roles: [], _byRole: new Map() });
     const out = byKey.get(key);
     for (const rawRole of r.roles || []) {
-      const role = findRole(listed, rawRole);
-      const name = role ? role[0] : String(rawRole || "").trim();
+      const { name: rawName, typeWords } = splitRoleText(rawRole);
+      const role = findRole(listed, rawName);
+      const name = role ? role[0] : rawName;
       if (!name) continue;
-      const seenKey = role ? `list:${role[0]}` : `new:${normalizeName(name)}`;
-      if (out._seen.has(seenKey)) continue;
-      out._seen.add(seenKey);
-      out.roles.push({ name, code: role ? role[1] : null, inList: !!role });
+      const types = resolveBusinessTypes(role, typeWords);
+      const roleKey = role ? `list:${role[0]}` : `new:${normalizeName(name)}`;
+      const existing = out._byRole.get(roleKey);
+      if (existing) {
+        // The same role written twice: keep one, with the types of both.
+        existing.types = uniqueInOrder([...existing.types, ...types]);
+        continue;
+      }
+      const entry = { name, code: role ? role[1] : null, inList: !!role, types };
+      out._byRole.set(roleKey, entry);
+      out.roles.push(entry);
     }
   }
-  return [...byKey.values()].map(({ _seen, ...rest }) => rest);
+  return [...byKey.values()].map(({ _byRole, ...rest }) => rest);
 }
 
 // The list exactly as it is shown to the AI in the prompt: one line per
@@ -680,7 +777,8 @@ function promptList() {
 }
 
 const ARF_TAXONOMY = {
-  TAXONOMY, BUSINESS_TYPE_BY_CODE, normalizeName, findEntity, findRole, businessTypesFor, classify, promptList,
+  TAXONOMY, BUSINESS_TYPES, BUSINESS_TYPE_GROUPS_BY_CODE, normalizeName, findEntity, findRole,
+  findBusinessType, splitRoleText, resolveBusinessTypes, classify, promptList,
 };
 globalThis.ARF_TAXONOMY = ARF_TAXONOMY;
 if (typeof module !== "undefined") module.exports = ARF_TAXONOMY;

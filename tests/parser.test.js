@@ -113,6 +113,19 @@ END OF ANSWERS`;
   ]);
 });
 
+test("roles split on ';' but never inside a role's [business type]", () => {
+  const typed = `COMPANY 1
+DESCRIPTION: ABC Seeds produces seeds.
+ENTITY: Seeds & biologicals | ROLES: Seed Distributor [Distributor]; Seed Importer / Exporter [Exporter; Importer]; Seed Company / Seed Producer
+END OF ANSWERS`;
+  const b = parseAnswer(typed, 1).blocks.get(1);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(b.entities[0].roles)), [
+    "Seed Distributor [Distributor]",
+    "Seed Importer / Exporter [Exporter; Importer]",
+    "Seed Company / Seed Producer",
+  ]);
+});
+
 test("a description broken over several lines is joined back up", () => {
   const multi = `COMPANY 1
 DESCRIPTION: ABC Seeds produces hybrid vegetable seeds.

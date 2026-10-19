@@ -65,7 +65,7 @@ test("a new entity keeps the AI's wording and all its roles are new", () => {
   const [c] = T.classify([{ entity: "Agri Insurance", roles: ["Crop Insurance Provider"] }]);
   assert.strictEqual(c.entity, "Agri Insurance");
   assert.strictEqual(c.entityInList, false);
-  assert.deepStrictEqual(c.roles, [{ name: "Crop Insurance Provider", code: null, inList: false }]);
+  assert.deepStrictEqual(c.roles, [{ name: "Crop Insurance Provider", code: null, inList: false, types: [] }]);
 });
 
 test("the same entity written twice is merged, and repeated roles are kept once", () => {
@@ -84,9 +84,3 @@ test("the same role name carries each entity's own code", () => {
   assert.strictEqual(b.roles[0].code, "M");
 });
 
-test("business type comes from the codes; G and code-less roles add nothing", () => {
-  assert.deepStrictEqual(T.businessTypesFor(["M", "D", "M"]), ["Manufacturer", "Distributor/Wholesaler/Trader/Supplier"]);
-  assert.deepStrictEqual(T.businessTypesFor(["EI+D"]), ["Exporter/Importer", "Distributor/Wholesaler/Trader/Supplier"]);
-  assert.deepStrictEqual(T.businessTypesFor(["G"]), []);
-  assert.deepStrictEqual(T.businessTypesFor([]), []);
-});
