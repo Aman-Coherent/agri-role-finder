@@ -111,9 +111,22 @@ const MAX_BATCH_SIZE = 10; // higher risks the query getting too long / the AI d
 // longer and the AI is more likely to cut it short.
 const DEFAULT_BATCH_SIZE = 3;
 
+// How many times a company may get NO answer (its block missing from the
+// reply, or the tab never reporting back) before it is recorded not_found.
+// See settleUnanswered.
+const MAX_ATTEMPTS = 2;
+// This many batches in a row with no answer at all pauses the run - see
+// emptyStreakPatch.
+const EMPTY_STREAK_LIMIT = 4;
+// How many times one batch's tab may be sent back to its search after a
+// CAPTCHA landed it elsewhere - see handleWorkerTabUrl.
+const MAX_RENAVIGATIONS = 2;
+
 // "found" here means "classified into at least one entity" - see
-// sanitizeResultEntry.
-const ALLOWED_STATUSES = new Set(["found", "not_found", "blocked"]);
+// sanitizeResultEntry. "missing" is never stored: it is content.js saying
+// "no answer for this company this time", which handleResult turns into
+// another try or not_found.
+const ALLOWED_STATUSES = new Set(["found", "not_found", "blocked", "missing"]);
 
 // Caps for the AI's free text. Generous enough for a real 2-3 sentence
 // description or a long role name, short enough that a runaway answer cannot
@@ -138,14 +151,26 @@ const DEFAULT_ENGINE = {
   isRunning: false,
   isPaused: false,
   pauseReason: null,
-  // tabIds of workers currently sitting on an unsolved CAPTCHA - non-empty
-  // implies isPaused. See handleCaptchaDetected/handleResult.
+  // Why the run is paused, which decides what may un-pause it on its own:
+  // only a "captcha" pause lifts automatically once every CAPTCHA is dealt
+  // with. "captcha_giveup" | "empty_streak" | "manual" wait for Resume.
+  pauseKind: null,
+  // tabIds of workers currently sitting on an unsolved CAPTCHA or consent
+  // page - non-empty implies isPaused. See markNeedsHuman.
   captchaTabIds: [],
-  // [{ tabId, windowId, ownsWindow, currentItemIds, batchToken }, ...] -
+  // { [tabId]: "captcha" | "consent" } for those tabs - only changes the
+  // wording of the pause message.
+  humanKinds: {},
+  // Batches in a row that came back with no answer at all - see
+  // emptyStreakPatch.
+  emptyStreak: 0,
+  // [{ tabId, windowId, ownsWindow, currentItemIds, batchToken, searchUrl }, ...] -
   // length === the active project's concurrency. `ownsWindow` records whether
   // THIS extension created that window (concurrency > 1 gives each worker its
   // own window - see ensureWorkerTab). It exists so cleanup can close what we
   // opened without ever closing a window the user opened themselves.
+  // `searchUrl` is the batch's own search, so a tab that lands somewhere
+  // else after a CAPTCHA can be sent back to it.
   workers: [],
 };
 
@@ -386,8 +411,6 @@ function buildPrompt(items) {
     `${ARF_TAXONOMY.BUSINESS_TYPES.join(", ")}. Pick the specific one - for example ` +
     `Exporter, not Exporter/Importer; Distributor, not Distributor/Wholesaler. If it ` +
     `is more than one, separate them with commas inside the brackets.\n\n` +
-    `LIST - each line is an entity, a colon, then that entity's roles separated by semicolons:\n` +
-    `${ARF_TAXONOMY.promptList()}\n\n` +
     `Reply in exactly this format and nothing else - no greeting, no explanation, ` +
     `no markdown, no tables:\n` +
     `COMPANY <number>\n` +
@@ -397,7 +420,12 @@ function buildPrompt(items) {
     `company numbers as above, keep the same order, and do not skip any company. ` +
     `After the last company, write one final line: END OF ANSWERS\n` +
     `If you cannot find reliable information about a company, write DESCRIPTION: NONE ` +
-    `and ENTITY: NONE for it instead of guessing - never invent what a company does.`
+    `and ENTITY: NONE for it instead of guessing - never invent what a company does.\n\n` +
+    // The long list goes LAST: if Google ever cuts a very long query short,
+    // what is lost is the end of the list - not the reply format above,
+    // without which no answer could be read at all.
+    `LIST - each line is an entity, a colon, then that entity's roles separated by semicolons:\n` +
+    `${ARF_TAXONOMY.promptList()}`
   );
 }
 
@@ -423,6 +451,27 @@ function buildPrompt(items) {
 //             this browser profile's search history
 function buildSearchUrl(items) {
   return `https://www.google.com/search?q=${encodeURIComponent(buildPrompt(items))}&hl=en&pws=0`;
+}
+
+function isGoogleUrl(url) {
+  return /^https:\/\/([^/]*\.)?google\.[a-z.]+\//i.test(url || "");
+}
+
+function isGoogleSearchUrl(url) {
+  return /^https:\/\/([^/]*\.)?google\.[a-z.]+\/search\b/i.test(url || "");
+}
+
+// Google's "unusual traffic" CAPTCHA page. A search it is suspicious of is
+// redirected here, so the results page - and content.js with it - never
+// loads at all. See handleWorkerTabUrl.
+function isSorryUrl(url) {
+  return /^https:\/\/([^/]*\.)?google\.[a-z.]+\/sorry\//i.test(url || "");
+}
+
+// Google's cookie-consent page ("Before you continue"), shown to some regions
+// before any search. Needs one click from a person, exactly like a CAPTCHA.
+function isConsentUrl(url) {
+  return /^https:\/\/consent\.google\.[a-z.]+\//i.test(url || "");
 }
 
 function isContextualTasksUrl(url) {
@@ -488,7 +537,7 @@ function sanitizeName(value) {
 function sanitizeResultEntry(entry) {
   if (!entry || typeof entry.itemId !== "string") return null;
   if (!ALLOWED_STATUSES.has(entry.status)) return null;
-  if (entry.status === "blocked") return { itemId: entry.itemId, status: "blocked" };
+  if (entry.status === "blocked" || entry.status === "missing") return { itemId: entry.itemId, status: entry.status };
   const description = sanitizeFreeText(entry.description, MAX_DESCRIPTION_LEN);
   const raw = (Array.isArray(entry.entities) ? entry.entities : [])
     .slice(0, MAX_ENTITIES_PER_COMPANY)
@@ -535,6 +584,13 @@ function buildCaptchaPauseReason(captchaTabIds, engine, project) {
       .map((item) => item.company_name);
   });
   const who = names.length ? names.join(", ") : "a company";
+  const kinds = captchaTabIds.map((id) => (engine.humanKinds || {})[id] || "captcha");
+  if (kinds.every((k) => k === "consent")) {
+    return (
+      `Google is asking you to accept or reject cookies (once) in the highlighted tab, ` +
+      `while searching for: ${who}. Answer it there - the run continues automatically after.`
+    );
+  }
   return (
     `CAPTCHA showing for: ${who}. Solve it in the highlighted tab - the run ` +
     `continues automatically once solved. Nothing else runs while this is up.`
@@ -724,6 +780,7 @@ async function processNext(workerIndex) {
   // one locked transaction, so two workers racing here can never claim the
   // same item.
   let claimed = null;
+  let searchUrl = null;
   const engineAfterClaim = await mutateEngine(async (engine) => {
     if (!engine.isRunning || engine.isPaused) return {}; // stopped/paused since we last checked
     const worker = engine.workers[workerIndex];
@@ -739,15 +796,18 @@ async function processNext(workerIndex) {
     const pending = fresh.queue.filter((c) => c.status === "pending" && !inFlightIds.has(c.id));
     if (!pending.length) return {};
     // Everything is claimed in batches of project.batchSize. A company a
-    // batch answer doesn't cover is recorded not_found by content.js after
-    // one reload of that search - recoverable later via "Retry not-found
-    // rows" - rather than pulled out for a slow one-at-a-time search.
+    // batch answer doesn't cover goes back in the queue once (joining a
+    // later batch - see settleUnanswered) rather than being pulled out for a
+    // slow one-at-a-time search.
     claimed = pending.slice(0, project.batchSize || DEFAULT_BATCH_SIZE);
+    searchUrl = buildSearchUrl(claimed);
     const workers = engine.workers.slice();
     workers[workerIndex] = {
       ...workers[workerIndex],
       currentItemIds: claimed.map((c) => c.id),
       batchToken: newBatchToken(),
+      searchUrl,
+      renavigations: 0,
       nudged: false, // one REPORT_NOW nudge is allowed per batch
     };
     return { workers };
@@ -767,7 +827,7 @@ async function processNext(workerIndex) {
   const concurrency = clampConcurrency(project.concurrency || 1);
   armWatchdog(workerIndex, computeWatchdogMs(claimed.length));
   const tabId = await ensureWorkerTab(workerIndex);
-  const url = buildSearchUrl(claimed);
+  const url = searchUrl;
   debug(
     `worker ${workerIndex}: claimed ${claimed.length} company(ies), navigating tab ${tabId} ` +
       `(watchdog ${Math.round(computeWatchdogMs(claimed.length) / 1000)}s)`,
@@ -779,33 +839,77 @@ async function processNext(workerIndex) {
   watchCommittedUrl(workerIndex, tabId);
 }
 
+// ---------------------------------------------------------------------------
+// Outcomes that need a decision: no answer, a stuck tab, a CAPTCHA
+// ---------------------------------------------------------------------------
+
+// A company that got no answer this time - its block was missing from the
+// AI's reply, or the tab never reported back at all. That says nothing about
+// the company itself (the AI skipped it, the page failed to load, Google
+// had a bad moment), so the first time it simply goes back in the queue and
+// joins a later batch alongside different companies. Only after
+// MAX_ATTEMPTS is it recorded not_found.
+//
+// An answer that explicitly said NONE is different - the AI looked and
+// didn't know - and is final straight away (see handleResult).
+function settleUnanswered(item) {
+  item.attempts = (item.attempts || 0) + 1;
+  item.status = item.attempts >= MAX_ATTEMPTS ? "not_found" : "pending";
+}
+
+function workerIndexForTab(engine, tabId) {
+  return engine.workers.findIndex((w) => w.tabId === tabId);
+}
+
+// The engine patch for one more batch that came back with nothing at all
+// (or never came back). Several in a row means something is wrong for every
+// company, not just these - the network is down, Google stopped showing AI
+// answers for this query, or its page changed - so the run pauses instead
+// of quietly working through the rest of the list marking everything
+// not_found. `answered` resets the streak.
+function emptyStreakPatch(e, answered) {
+  if (answered) return { emptyStreak: 0 };
+  const emptyStreak = (e.emptyStreak || 0) + 1;
+  if (emptyStreak < EMPTY_STREAK_LIMIT || !e.isRunning || e.isPaused) return { emptyStreak };
+  return {
+    emptyStreak,
+    isPaused: true,
+    pauseKind: "empty_streak",
+    pauseReason:
+      `No answers came back for ${emptyStreak} searches in a row, so the run paused instead of marking ` +
+      `everything not found. Check one of the Google tabs (internet down? Google showing no AI answer?), ` +
+      `then click Resume.`,
+  };
+}
+
 // Fires (after computeWatchdogMs(), or CAPTCHA_WATCHDOG_MS for a worker
-// that's been sitting on a CAPTCHA - see handleCaptchaDetected) if a
-// worker never reported a RESULT for its claimed batch in the meantime,
-// and frees the worker so the run keeps moving instead of hanging on it
-// forever. A plain stuck tab (bad layout, crash, page never loaded) marks
-// every still-pending item in that batch not_found, same as always. A
-// CAPTCHA nobody solved in time marks them blocked instead - they
-// genuinely do need a manual look - and leaves the run paused rather than
-// quietly continuing, since giving up is not the same as solving it.
+// that's been sitting on a CAPTCHA - see markNeedsHuman) if a worker never
+// reported a RESULT for its claimed batch in the meantime, and frees the
+// worker so the run keeps moving instead of hanging on it forever.
+//   - A plain stuck tab (page never loaded, network error page, a layout the
+//     content script didn't expect, a crash): its companies count one
+//     unanswered attempt each - see settleUnanswered.
+//   - A CAPTCHA/consent page nobody dealt with in time: its companies are
+//     marked blocked and the run stays paused, since giving up is not the
+//     same as solving it. Resume puts blocked companies back in the queue.
 async function handleWatchdogTimeout(workerIndex) {
   const engine = await getEngine();
   const worker = engine.workers[workerIndex];
   const stuckItemIds = (worker && worker.currentItemIds) || [];
   if (!stuckItemIds.length || !engine.activeProjectId) return; // already resolved normally - nothing to do
 
-  // Last chance before writing this batch off. Worker tabs run hidden, and
+  const isHumanStall = worker.tabId != null && engine.captchaTabIds.includes(worker.tabId);
+
+  // Last chance before giving up on this batch. Worker tabs run hidden, and
   // Chrome throttles a hidden tab's timers hard (roughly once a minute once
   // it's been hidden a few minutes). A tab in that state can be sitting on a
   // complete, perfectly readable answer and simply not have gotten around to
   // ending its own wait. Message delivery is NOT throttled, so asking it
-  // directly works where its own timers don't - and a real answer here beats
-  // marking five companies not_found, which is final.
+  // directly works where its own timers don't.
   //
   // One attempt per batch (nudged flag), and never for a CAPTCHA stall: that
   // needs a person, not a nudge.
-  const isCaptchaStall = worker.tabId != null && engine.captchaTabIds.includes(worker.tabId);
-  if (!isCaptchaStall && !worker.nudged && worker.tabId != null) {
+  if (!isHumanStall && !worker.nudged && worker.tabId != null) {
     const stuckToken = worker.batchToken;
     let stillWaiting = false;
     try {
@@ -833,92 +937,235 @@ async function handleWatchdogTimeout(workerIndex) {
 
   const project = await getProject(engine.activeProjectId);
   if (!project) return;
-  const wasAwaitingCaptcha = worker.tabId != null && engine.captchaTabIds.includes(worker.tabId);
-  let anyStillPending = false;
   let sampleCompanyName = null;
   for (const id of stuckItemIds) {
     const item = project.queue.find((c) => c.id === id);
-    if (!item || item.status !== "pending") continue; // already resolved normally - nothing to do for this one
-    anyStillPending = true;
+    if (!item || item.status !== "pending") continue; // already resolved normally
     sampleCompanyName = sampleCompanyName || item.company_name;
-    item.status = wasAwaitingCaptcha ? "blocked" : "not_found";
+    if (isHumanStall) item.status = "blocked";
+    else settleUnanswered(item);
   }
-  if (!anyStillPending) return;
 
   console.warn(
-    `[AgriRoleFinder] watchdog fired for worker ${workerIndex} after ` +
-      `${wasAwaitingCaptcha ? Math.round(CAPTCHA_WATCHDOG_MS / 1000) : "the normal"}s - ` +
-      `${stuckItemIds.length} company(ies) marked ${wasAwaitingCaptcha ? "blocked" : "not_found"} ` +
-      `(no RESULT came back in time; e.g. "${sampleCompanyName}")`
+    `[AgriRoleFinder] watchdog fired for worker ${workerIndex} - ` +
+      `${stuckItemIds.length} company(ies) ${isHumanStall ? "marked blocked (CAPTCHA not solved in time)" : "got no answer this time"}` +
+      (sampleCompanyName ? ` (e.g. "${sampleCompanyName}")` : "")
   );
 
   project.completionLog = [...(project.completionLog || []), Date.now()].slice(-COMPLETION_LOG_SIZE);
   await saveProject(project);
   await updateIndexCounts(project);
 
+  // The worker is always freed - even if every one of its companies turned
+  // out to be resolved already - or it would sit "busy" forever.
   const stuckBatchToken = worker.batchToken;
   const newEngine = await mutateEngine((e) => {
     const workers = e.workers.slice();
     if (workers[workerIndex] && workers[workerIndex].batchToken === stuckBatchToken) {
-      workers[workerIndex] = { ...workers[workerIndex], currentItemIds: [], batchToken: null };
+      workers[workerIndex] = { ...workers[workerIndex], currentItemIds: [], batchToken: null, searchUrl: null };
     }
-    if (!wasAwaitingCaptcha || worker.tabId == null) return { workers };
+    if (!isHumanStall) return { workers, ...emptyStreakPatch(e, false) };
     const captchaTabIds = e.captchaTabIds.filter((id) => id !== worker.tabId);
+    const humanKinds = { ...(e.humanKinds || {}) };
+    delete humanKinds[worker.tabId];
     const pauseReason =
       captchaTabIds.length > 0
-        ? buildCaptchaPauseReason(captchaTabIds, e, project)
+        ? buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds }, project)
         : `Gave up waiting for a CAPTCHA to be solved (no response after ` +
-          `${Math.round(CAPTCHA_WATCHDOG_MS / 60000)} min) on "${sampleCompanyName}"` +
-          `${stuckItemIds.length > 1 ? ` and ${stuckItemIds.length - 1} more` : ""} - marked as blocked for ` +
-          `manual review. Click Resume to continue with the rest.`;
-    return { workers, captchaTabIds, isPaused: true, pauseReason };
+          `${Math.round(CAPTCHA_WATCHDOG_MS / 60000)} min)` +
+          (sampleCompanyName ? ` on "${sampleCompanyName}"` : "") +
+          `. Click Resume to continue - those companies are searched again.`;
+    return {
+      workers, captchaTabIds, humanKinds, isPaused: true, pauseReason,
+      pauseKind: captchaTabIds.length > 0 ? "captcha" : "captcha_giveup",
+    };
   });
   updateBadge(newEngine, project);
 
-  // A plain stuck tab isn't necessarily Google blocking us, so let the run
-  // carry on. A CAPTCHA give-up, though, always leaves the run paused
-  // (set above) - never auto-resume from giving up.
-  if (!wasAwaitingCaptcha && newEngine.isRunning && !newEngine.isPaused) {
+  if (!isHumanStall && newEngine.isRunning && !newEngine.isPaused) {
     scheduleNext(workerIndex, randomDelayMs(project));
   }
 }
 
-// A worker's tab hit a CAPTCHA. Rather than failing that batch of
-// companies, this pauses the whole run (other tabs shouldn't keep
-// hammering Google while one of them just got challenged) and brings the
-// tab to front so it's actually visible to solve - these worker tabs run
-// hidden (`active: false`) by design otherwise. The long
-// CAPTCHA_WATCHDOG_MS leash (armed here, in place of the normal
-// batch-scaled watchdog) is the backstop if nobody ever comes back to it;
-// see handleWatchdogTimeout.
-async function handleCaptchaDetected(rawMessage, tabId) {
+// A worker's tab needs a person: a CAPTCHA (Google's /sorry/ page, or one
+// shown inline on the results page) or Google's cookie-consent page. Rather
+// than failing that batch, this pauses the whole run (other tabs shouldn't
+// keep hitting Google while one of them is being challenged) and brings the
+// tab to the front, since worker tabs otherwise run in the background. The
+// long CAPTCHA_WATCHDOG_MS leash replaces the normal batch watchdog as the
+// backstop if nobody ever comes back; see handleWatchdogTimeout. Once it is
+// dealt with, handleHumanCleared (or handleResult, for an inline CAPTCHA
+// solved without leaving the page) resumes the run.
+//
+// It never tries to solve, click through or bypass one itself.
+async function markNeedsHuman(workerIndex, tabId, kind) {
   const engine = await getEngine();
-  const workerIndex = engine.workers.findIndex((w) => w.tabId === tabId);
-  if (workerIndex === -1) return;
   const worker = engine.workers[workerIndex];
-  if (!engine.activeProjectId || !(worker.currentItemIds || []).length) return; // stale/unexpected - ignore
-  if (rawMessage.batchToken !== worker.batchToken) return; // this worker has already moved on - ignore
-
-  armWatchdog(workerIndex, CAPTCHA_WATCHDOG_MS);
-
+  if (!engine.activeProjectId || !worker || !(worker.currentItemIds || []).length) return;
+  if (engine.captchaTabIds.includes(tabId)) return; // already flagged - e.g. re-detected after a failed solve attempt
   const project = await getProject(engine.activeProjectId);
   if (!project) return;
 
+  armWatchdog(workerIndex, CAPTCHA_WATCHDOG_MS);
   const newEngine = await mutateEngine((e) => {
-    if (e.captchaTabIds.includes(tabId)) return {}; // already flagged - e.g. re-detected after a failed solve attempt
+    if (e.captchaTabIds.includes(tabId)) return {};
     const captchaTabIds = [...e.captchaTabIds, tabId];
-    return { isPaused: true, pauseReason: buildCaptchaPauseReason(captchaTabIds, e, project), captchaTabIds };
+    const humanKinds = { ...(e.humanKinds || {}), [tabId]: kind };
+    return {
+      isPaused: true,
+      pauseKind: "captcha",
+      pauseReason: buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds }, project),
+      captchaTabIds,
+      humanKinds,
+    };
   });
   updateBadge(newEngine, project);
+  console.warn(`[AgriRoleFinder] worker ${workerIndex}: ${kind} page in tab ${tabId} - run paused for you to deal with it`);
 
   try {
     const tab = await chrome.tabs.get(tabId);
     await chrome.tabs.update(tabId, { active: true });
     await chrome.windows.update(tab.windowId, { focused: true });
   } catch {
-    // Tab/window closed out from under us - nothing more to do here; the
-    // watchdog armed above still catches this case if nobody comes back.
+    // Tab/window closed out from under us - handleWorkerTabClosed deals with
+    // that.
   }
+}
+
+// The CAPTCHA/consent page was dealt with: the tab has navigated back onto a
+// Google results page (Google's own redirect after solving). That search
+// still has to run there, so this worker gets a fresh normal watchdog - the
+// 10-minute CAPTCHA leash was armed when the CAPTCHA appeared, and could
+// otherwise expire while the answer is still being written, which would
+// wrongly mark the batch blocked. If it was the last outstanding one, the
+// whole run resumes immediately rather than waiting for this batch's answer.
+async function handleHumanCleared(workerIndex, tabId) {
+  const engine = await getEngine();
+  const worker = engine.workers[workerIndex];
+  if (!worker || !(worker.currentItemIds || []).length) return;
+  const project = await getProject(engine.activeProjectId);
+  if (!project) return;
+
+  armWatchdog(workerIndex, computeWatchdogMs(worker.currentItemIds.length));
+  let resumeAll = false;
+  const newEngine = await mutateEngine((e) => {
+    if (!e.captchaTabIds.includes(tabId)) return {};
+    const captchaTabIds = e.captchaTabIds.filter((id) => id !== tabId);
+    const humanKinds = { ...(e.humanKinds || {}) };
+    delete humanKinds[tabId];
+    if (captchaTabIds.length === 0 && e.isPaused && e.pauseKind === "captcha") {
+      resumeAll = true;
+      return { captchaTabIds, humanKinds, isPaused: false, pauseKind: null, pauseReason: null };
+    }
+    return {
+      captchaTabIds,
+      humanKinds,
+      ...(captchaTabIds.length ? { pauseReason: buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds }, project) } : {}),
+    };
+  });
+  updateBadge(newEngine, project);
+  console.warn(`[AgriRoleFinder] worker ${workerIndex}: CAPTCHA/consent cleared in tab ${tabId}` + (resumeAll ? " - resuming the run" : ""));
+  // processNext is a no-op for this worker (it still holds its batch), so
+  // this only restarts the others.
+  if (resumeAll) wakeAllWorkers(newEngine.workers.length);
+}
+
+// content.js saw a CAPTCHA on the results page itself.
+async function handleCaptchaDetected(rawMessage, tabId) {
+  const engine = await getEngine();
+  const workerIndex = workerIndexForTab(engine, tabId);
+  if (workerIndex === -1) return;
+  if (rawMessage.batchToken !== engine.workers[workerIndex].batchToken) return; // this worker has already moved on - ignore
+  await markNeedsHuman(workerIndex, tabId, "captcha");
+}
+
+// Every URL change of a worker tab, straight from Chrome. This is how a
+// CAPTCHA is noticed at all in the usual case: Google answers a search it
+// considers suspicious by REDIRECTING to https://www.google.com/sorry/...,
+// a page content.js is never injected into (it only runs on /search). The
+// same goes for the cookie-consent page on consent.google.com.
+//
+// Only a URL change (changeInfo.url) can mean "solved" - the redirect back
+// to /search. A "finished loading" event for the page the tab is already on
+// never does, or the very page that showed an inline CAPTCHA would clear it.
+async function handleWorkerTabUrl(tabId, url, isUrlChange) {
+  const engine = await getEngine();
+  if (!engine.activeProjectId) return;
+  const workerIndex = workerIndexForTab(engine, tabId);
+  if (workerIndex === -1) return;
+  const worker = engine.workers[workerIndex];
+  if (!(worker.currentItemIds || []).length) return;
+  const waiting = engine.captchaTabIds.includes(tabId);
+
+  if (isSorryUrl(url)) {
+    if (!waiting) await markNeedsHuman(workerIndex, tabId, "captcha");
+    return;
+  }
+  if (isConsentUrl(url)) {
+    if (!waiting) await markNeedsHuman(workerIndex, tabId, "consent");
+    return;
+  }
+  if (!waiting) return;
+  if (isUrlChange && isGoogleSearchUrl(url)) {
+    await handleHumanCleared(workerIndex, tabId);
+    return;
+  }
+  // Solved, but Google's redirect landed somewhere other than the results
+  // page (its home page, say - the continue link can get lost on a query
+  // this long). Send the tab back to this batch's own search; arriving there
+  // is what clears the pause.
+  //
+  // Never for a page that already IS a search: an inline CAPTCHA sits on the
+  // results page, and that page finishing loading (or you refreshing it)
+  // would otherwise re-open the search, finish loading, re-open it again -
+  // an endless reload loop. And at most MAX_RENAVIGATIONS per batch, as a
+  // hard stop against any loop this reasoning missed.
+  if (!isUrlChange && isGoogleUrl(url) && !isGoogleSearchUrl(url) && worker.searchUrl) {
+    let allowed = false;
+    await mutateEngine((e) => {
+      const w = e.workers[workerIndex];
+      if (!w || w.batchToken !== worker.batchToken || (w.renavigations || 0) >= MAX_RENAVIGATIONS) return {};
+      allowed = true;
+      const workers = e.workers.slice();
+      workers[workerIndex] = { ...w, renavigations: (w.renavigations || 0) + 1 };
+      return { workers };
+    });
+    if (!allowed) return;
+    console.warn(`[AgriRoleFinder] worker ${workerIndex}: landed on ${url.slice(0, 60)} after the CAPTCHA - re-opening the search`);
+    await chrome.tabs.update(tabId, { url: worker.searchUrl });
+  }
+}
+
+// A worker tab was closed (by you, or by Chrome). Its companies were never
+// actually answered, so they simply stay pending - no attempt is counted
+// against them - and the worker gets a new tab on its next batch. If that
+// tab was the one showing a CAPTCHA, the run stays paused: closing it is
+// not solving it.
+async function handleWorkerTabClosed(tabId) {
+  let freedIndex = -1;
+  const newEngine = await mutateEngine((e) => {
+    const idx = workerIndexForTab(e, tabId);
+    if (idx === -1) return {};
+    freedIndex = idx;
+    const workers = e.workers.slice();
+    workers[idx] = {
+      ...workers[idx], tabId: null, windowId: null, ownsWindow: false,
+      currentItemIds: [], batchToken: null, searchUrl: null,
+    };
+    if (!e.captchaTabIds.includes(tabId)) return { workers };
+    const captchaTabIds = e.captchaTabIds.filter((id) => id !== tabId);
+    const humanKinds = { ...(e.humanKinds || {}) };
+    delete humanKinds[tabId];
+    if (captchaTabIds.length) return { workers, captchaTabIds, humanKinds };
+    return {
+      workers, captchaTabIds, humanKinds, isPaused: true, pauseKind: "manual",
+      pauseReason: "The tab showing the CAPTCHA was closed before it was solved. Click Resume to continue.",
+    };
+  });
+  if (freedIndex === -1) return;
+  disarmWatchdog(freedIndex);
+  debug(`worker ${freedIndex}: its tab ${tabId} was closed - its companies stay in the queue`);
+  if (newEngine.isRunning && !newEngine.isPaused) scheduleNext(freedIndex, 3000);
 }
 
 // content.js got a completely empty answer and is about to reload the same
@@ -927,7 +1174,7 @@ async function handleCaptchaDetected(rawMessage, tabId) {
 // of the way through its window) cut it off mid-retry.
 async function handleRetrySearch(rawMessage, tabId) {
   const engine = await getEngine();
-  const workerIndex = engine.workers.findIndex((w) => w.tabId === tabId);
+  const workerIndex = workerIndexForTab(engine, tabId);
   if (workerIndex === -1) return;
   const worker = engine.workers[workerIndex];
   if (!engine.activeProjectId || !(worker.currentItemIds || []).length) return;
@@ -941,7 +1188,7 @@ async function handleResult(rawMessage, tabId) {
   if (!rawMessage || !Array.isArray(rawMessage.results)) return; // malformed - drop it
 
   const engine = await getEngine();
-  const workerIndex = engine.workers.findIndex((w) => w.tabId === tabId);
+  const workerIndex = workerIndexForTab(engine, tabId);
   if (workerIndex === -1) return; // not a recognized worker tab
   const worker = engine.workers[workerIndex];
   if (!engine.activeProjectId || !(worker.currentItemIds || []).length) return; // stale/unexpected - ignore
@@ -963,20 +1210,26 @@ async function handleResult(rawMessage, tabId) {
 
   const claimedIds = new Set(worker.currentItemIds);
   let anyResolved = false;
+  let anyAnswered = false;
   let anyBlocked = false;
   for (const raw of rawMessage.results) {
     if (!raw || !claimedIds.has(raw.itemId)) continue; // not part of this worker's claimed batch - ignore
     const entry = sanitizeResultEntry(raw);
     if (!entry) continue; // malformed/failed re-validation - drop just this entry
     const item = project.queue.find((c) => c.id === entry.itemId);
-    if (!item) continue;
+    if (!item || item.status !== "pending") continue;
     anyResolved = true;
 
+    if (entry.status === "missing") {
+      settleUnanswered(item);
+      continue;
+    }
     item.status = entry.status; // "found" | "not_found" | "blocked"
     if (entry.status === "blocked") {
       anyBlocked = true;
       continue; // nothing was read - keep whatever an earlier pass found
     }
+    anyAnswered = true;
     // Never overwrite something with nothing: a "Retry not-found rows" pass
     // that comes back emptier than the first must not blank out a
     // description the first pass did get.
@@ -991,12 +1244,11 @@ async function handleResult(rawMessage, tabId) {
   }
 
   const claimedBatchToken = worker.batchToken;
-  // Any real result at all - even not_found - means this tab
-  // made it past whatever CAPTCHA it was showing (content.js's own
-  // last-resort give-up, status "blocked" on every entry, doesn't count as
-  // solved). If this was the last outstanding CAPTCHA, the run can resume
-  // on its own - that's the whole point of pausing on CAPTCHA instead of
-  // just failing the batch.
+  // Any real result at all means this tab made it past whatever CAPTCHA it
+  // was showing (content.js's own last-resort give-up, status "blocked" on
+  // every entry, doesn't count as solved). If this was the last outstanding
+  // CAPTCHA, the run can resume on its own - but only a pause that was FOR
+  // that CAPTCHA; a pause for any other reason waits for Resume.
   const clearedCaptcha = !anyBlocked;
   let resolvingLastCaptcha = false;
 
@@ -1005,19 +1257,23 @@ async function handleResult(rawMessage, tabId) {
     // Only clear if this worker still points at the same batch - defends
     // against any unexpected reordering of concurrent messages.
     if (workers[workerIndex] && workers[workerIndex].batchToken === claimedBatchToken) {
-      workers[workerIndex] = { ...workers[workerIndex], currentItemIds: [], batchToken: null };
+      workers[workerIndex] = { ...workers[workerIndex], currentItemIds: [], batchToken: null, searchUrl: null };
     }
+    const streak = anyBlocked ? {} : emptyStreakPatch(e, anyAnswered);
     const wasCaptchaTab = e.captchaTabIds.includes(tabId);
-    if (!wasCaptchaTab) return { workers };
+    if (!wasCaptchaTab) return { workers, ...streak };
     const captchaTabIds = e.captchaTabIds.filter((id) => id !== tabId);
-    resolvingLastCaptcha = clearedCaptcha && e.isPaused && captchaTabIds.length === 0;
+    const humanKinds = { ...(e.humanKinds || {}) };
+    delete humanKinds[tabId];
+    resolvingLastCaptcha = clearedCaptcha && e.isPaused && e.pauseKind === "captcha" && captchaTabIds.length === 0;
     return {
       workers,
       captchaTabIds,
+      humanKinds,
       ...(resolvingLastCaptcha
-        ? { isPaused: false, pauseReason: null }
+        ? { isPaused: false, pauseKind: null, pauseReason: null }
         : captchaTabIds.length > 0
-        ? { pauseReason: buildCaptchaPauseReason(captchaTabIds, e, project) }
+        ? { pauseReason: buildCaptchaPauseReason(captchaTabIds, { ...e, humanKinds }, project) }
         : {}),
     };
   });
@@ -1035,6 +1291,53 @@ async function handleResult(rawMessage, tabId) {
     scheduleNext(workerIndex, randomDelayMs(project));
   }
 }
+
+// Chrome restarted, or the extension was reloaded/updated, mid-run. Every
+// worker tab and timer from before is gone (or no longer ours), so a run
+// still marked "running" would sit there doing nothing. Instead it is paused
+// with the reason shown, and Resume picks up exactly where it stopped:
+// companies that were in flight never left "pending", so nothing is lost or
+// skipped.
+async function resetAfterRestart(reason, closeOldTabs) {
+  const before = await getEngine();
+  if (!before.activeProjectId || (!before.isRunning && !before.isPaused)) return;
+  clearAllWorkerAlarms(before.workers.length);
+  const after = await mutateEngine((e) => ({
+    isRunning: true,
+    isPaused: true,
+    pauseKind: "manual",
+    pauseReason: reason,
+    captchaTabIds: [],
+    humanKinds: {},
+    emptyStreak: 0,
+    workers: e.workers.map((w) => ({
+      ...w, tabId: null, windowId: null, ownsWindow: false,
+      currentItemIds: [], batchToken: null, searchUrl: null, nudged: false,
+    })),
+  }));
+  // Tab ids are only unique within one browser session, so the old ones are
+  // only closed when Chrome itself did NOT restart (an extension reload) -
+  // after a restart they could belong to tabs of yours.
+  if (closeOldTabs) await closeWorkerSurfaces(before.workers);
+  updateBadge(after, await getProject(after.activeProjectId));
+}
+
+chrome.runtime.onStartup.addListener(() => {
+  resetAfterRestart("Chrome was restarted while this project was running. Click Resume to continue where it left off.", false);
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  resetAfterRestart("The extension was reloaded or updated while this project was running. Click Resume to continue where it left off.", true);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url) handleWorkerTabUrl(tabId, changeInfo.url, true);
+  else if (changeInfo.status === "complete" && tab && tab.url) handleWorkerTabUrl(tabId, tab.url, false);
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  handleWorkerTabClosed(tabId);
+});
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name.startsWith(WATCHDOG_PREFIX)) {
@@ -1195,6 +1498,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         for (const item of project.queue) {
           if (item.status === "not_found") {
             item.status = "pending";
+            item.attempts = 0;
             count++;
           }
         }
@@ -1214,15 +1518,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const engineBefore = await getEngine();
         if (engineBefore.activeProjectId === message.projectId && (engineBefore.isRunning || engineBefore.isPaused)) {
           clearAllWorkerAlarms(engineBefore.workers.length);
-          await closeWorkerSurfaces(engineBefore.workers);
+          // Engine first, tabs second: closing a tab fires
+          // handleWorkerTabClosed, which must find nothing left to reschedule.
           await mutateEngine(() => ({
             isRunning: false,
             isPaused: false,
             pauseReason: null,
+            pauseKind: null,
             activeProjectId: null,
             captchaTabIds: [],
+            humanKinds: {},
             workers: [],
           }));
+          await closeWorkerSurfaces(engineBefore.workers);
           chrome.action.setBadgeText({ text: "" });
         }
         delete index[message.projectId];
@@ -1261,7 +1569,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             isRunning: true,
             isPaused: false,
             pauseReason: null,
+            pauseKind: null,
             captchaTabIds: [],
+            humanKinds: {},
+            emptyStreak: 0,
             workers,
           };
         });
@@ -1273,15 +1584,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case "STOP": {
         const before = await getEngine();
         clearAllWorkerAlarms(before.workers.length);
-        // Close the windows/tabs this run opened. At concurrency 1 that's one
-        // tab; at 8 it's eight windows, and leaving those lying around after
-        // Stop is its own kind of mess. closeWorkerSurfaces only ever closes
-        // what the extension itself created (see ownsWindow).
-        await closeWorkerSurfaces(before.workers);
         const stopped = await mutateEngine((engine) => ({
           isRunning: false,
           isPaused: false,
+          pauseReason: null,
+          pauseKind: null,
           captchaTabIds: [],
+          humanKinds: {},
           workers: engine.workers.map((w) => ({
             ...w,
             tabId: null,
@@ -1289,8 +1598,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             ownsWindow: false,
             currentItemIds: [],
             batchToken: null,
+            searchUrl: null,
           })),
         }));
+        // Close the windows/tabs this run opened - AFTER the engine is
+        // stopped, so handleWorkerTabClosed (fired by each close) finds no
+        // worker to reschedule. closeWorkerSurfaces only ever closes what the
+        // extension itself created (see ownsWindow). Companies that were in
+        // flight never left "pending", so Start picks them up again.
+        await closeWorkerSurfaces(before.workers);
         const project = stopped.activeProjectId ? await getProject(stopped.activeProjectId) : null;
         updateBadge(stopped, project);
         sendResponse({ ok: true });
@@ -1303,10 +1619,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: false, error: "That project no longer exists." });
           return;
         }
+        // Blocked companies were never answered - a CAPTCHA got in the way,
+        // which says nothing about the company - so resuming searches them
+        // again rather than leaving them for a manual pass.
+        let requeued = 0;
+        for (const item of project.queue) {
+          if (item.status === "blocked") {
+            item.status = "pending";
+            requeued++;
+          }
+        }
+        if (requeued) {
+          await saveProject(project);
+          await updateIndexCounts(project);
+        }
         const resumed = await mutateEngine(() => ({
           isRunning: true,
           isPaused: false,
           pauseReason: null,
+          pauseKind: null,
+          emptyStreak: 0,
         }));
         updateBadge(resumed, project);
         wakeAllWorkers(resumed.workers.length);

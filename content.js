@@ -18,14 +18,16 @@
  * list's auto-generated numbers) is really in the page - so one skipped
  * company doesn't shift every answer after it onto the wrong company. A
  * company with no block is never guessed at: if the whole answer came back
- * empty the search is RELOADED once, and anything still unresolved after
- * that is recorded not_found so the run moves on.
+ * empty the search is RELOADED once, and anything still unanswered after
+ * that is reported "missing" - background.js puts it back in the queue once
+ * (it joins a later batch) before recording it not_found.
  *
  * This script only reports what the AI wrote. Whether each entity/role is on
  * the list is decided in background.js against taxonomy.js.
  *
- * Reading the page: innerText first, with deepText() as a fallback for
- * answers composed inside shadow roots - see pageText().
+ * Reading the page: innerText, and deepText() for answers composed inside
+ * shadow roots or folded away - whichever finds more (see bestAnswerText).
+ * A folded "Show more" answer is also expanded (expandCollapsedAnswer).
  *
  * NOTE ON AI MODE: this deliberately does not request &udm=50. Chrome
  * intercepts that and renders it on an internal chrome:// page that no
@@ -35,7 +37,9 @@
  * background.js (which pauses the whole run and brings this tab to the
  * front) and then just waits - however long it takes - for a human to clear
  * it. It never tries to solve or bypass one. See waitForCaptchaSolved() and
- * background.js's CAPTCHA_WATCHDOG_MS for the give-up backstop.
+ * background.js's CAPTCHA_WATCHDOG_MS for the give-up backstop. Google's
+ * usual CAPTCHA is a separate /sorry/ page this script never runs on at all;
+ * background.js catches that one from the tab's URL (handleWorkerTabUrl).
  *
  * If this page load isn't part of an active automation run (e.g. you're
  * just browsing Google yourself), GET_CURRENT returns null and this script
@@ -176,21 +180,48 @@
   // names, and Google composes one rendered line out of several nested <div>s
   // styled inline. The sibling extension measured this on the real page:
   // innerText found every answer line; the walker split them apart.
-  // deepText() is kept strictly as a fallback for text inside shadow roots,
-  // which innerText omits - see deepenIfEmpty().
+  // deepText() is the second opinion for text innerText cannot see - see
+  // bestAnswerText().
   function pageText() {
     if (!document.body) return "";
     const light = document.body.innerText || "";
     return light.trim() ? light : deepText(document.body);
   }
 
-  // Second opinion for when the normal read produced nothing parseable.
-  // `count` says how many parseable items each candidate text yields, so the
-  // deeper read is only adopted if it genuinely finds more.
-  function deepenIfEmpty(text, count) {
-    if (count(text) > 0 || !document.body) return text;
+  // The final read of the answer. innerText misses text inside shadow roots,
+  // and text Google has folded away behind "Show more" (hidden text is not
+  // part of innerText at all); deepText() sees both, but is worse at line
+  // breaks. So both are parsed and whichever yields more answered companies
+  // wins - innerText on a tie, since its lines are the more reliable.
+  function bestAnswerText(expected) {
+    const light = pageText();
+    if (!document.body) return light;
     const deep = deepText(document.body);
-    return count(deep) > count(text) ? deep : text;
+    const score = (t) => answeredCount(parseAnswer(t, expected), expected);
+    return score(deep) > score(light) ? deep : light;
+  }
+
+  // Google sometimes folds a long AI answer behind a "Show more" control, and
+  // the folded part is missing from innerText - for a batch answer that can be
+  // every company after the first. Clicking it is an ordinary page control,
+  // like scrolling. Only real buttons are clicked, never links (a "Show more"
+  // link would navigate the tab away from the answer), each at most once, and
+  // only a few per page.
+  const EXPAND_LABEL_RE = /^(show more|show all|read more)$/i;
+  const MAX_EXPAND_CLICKS = 3;
+  let expandClicks = 0;
+  function expandCollapsedAnswer() {
+    if (expandClicks >= MAX_EXPAND_CLICKS || !document.body) return;
+    for (const el of document.querySelectorAll("[role='button'], button, [aria-expanded='false']")) {
+      if (el.dataset.arfExpanded || el.closest("a[href]")) continue;
+      const label = (el.getAttribute("aria-label") || el.textContent || "").replace(/\s+/g, " ").trim();
+      if (!EXPAND_LABEL_RE.test(label) || el.getAttribute("aria-expanded") === "true") continue;
+      el.dataset.arfExpanded = "1";
+      expandClicks++;
+      debug(`expanding a folded answer ("${label}")`);
+      el.click();
+      return;
+    }
   }
 
   // Google shows these while it is still researching/generating - they are a
@@ -439,6 +470,7 @@
       const check = () => {
         if (settled) return;
         if (isBlockedPage()) return finish("blocked");
+        expandCollapsedAnswer();
         const text = pageText();
         if (/something went wrong/i.test(text)) return finish("error");
         if (readyFn(text)) return finish("ready");
@@ -496,13 +528,15 @@
       if (!current || !Array.isArray(current.items) || !current.items.length) return; // not part of an active run - don't touch the page
       await runInner(current);
     } catch (err) {
-      console.error("Agri Role Finder: content script error, reporting not_found instead of hanging", err);
+      console.error("Agri Role Finder: content script error, reporting no answer instead of hanging", err);
       try {
         if (current && current.batchToken && Array.isArray(current.items)) {
           chrome.runtime.sendMessage({
             type: "RESULT",
             batchToken: current.batchToken,
-            results: current.items.map((it) => ({ itemId: it.itemId, status: "not_found" })),
+            // "missing", not not_found: a script error says nothing about
+            // the companies, so they get their normal second try.
+            results: current.items.map((it) => ({ itemId: it.itemId, status: "missing" })),
           });
         }
       } catch {
@@ -567,14 +601,16 @@
       outcome = await waitForAnswer(readyFn, quietMsFn, waitMs);
     }
 
-    const answerText = deepenIfEmpty(pageText(), (t) => answeredCount(parseAnswer(t, n), n));
+    expandCollapsedAnswer();
+    const answerText = bestAnswerText(n);
     const parsed = parseAnswer(answerText, n);
     const answered = answeredCount(parsed, n);
 
     // Nothing at all came back for this search. Reload the exact same query
     // ONCE - Google frequently answers on a second attempt when the first
-    // produced no answer panel. If the retry is also empty, the whole batch
-    // is recorded not_found below and the run moves on.
+    // produced no answer panel. If the retry is also empty, every company is
+    // reported "missing" below and the run moves on (background.js gives
+    // each one more try in a later batch).
     //
     // Only a completely empty answer triggers this. If even one company
     // parsed, that data is reported immediately instead - a reload would
@@ -591,12 +627,14 @@
         location.reload();
         return; // this script instance is about to be torn down by the reload
       }
-      debug(`runBatch: retry also came back empty - recording ${n} not_found and moving on`);
+      debug(`runBatch: retry also came back empty - reporting ${n} missing and moving on`);
     }
 
     const results = items.map((it, idx) => {
       const block = parsed.blocks.get(idx + 1);
-      if (!block || !block.answered) return { itemId: it.itemId, status: "not_found" };
+      // No block at all: the AI skipped this company. That is "missing" (try
+      // again later), unlike an explicit NONE answer, which is final.
+      if (!block || !block.answered) return { itemId: it.itemId, status: "missing" };
       return {
         itemId: it.itemId,
         // background.js re-derives this from what survives its own checks.

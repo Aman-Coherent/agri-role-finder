@@ -9,12 +9,16 @@ const ROOT = path.join(__dirname, "..");
 
 function chromeStub() {
   const noop = () => {};
+  const event = () => ({ addListener: noop });
   return {
-    runtime: { id: "test", onMessage: { addListener: noop }, sendMessage: async () => ({ engine: {}, summaries: [] }) },
-    alarms: { create: noop, clear: noop, onAlarm: { addListener: noop } },
+    runtime: {
+      id: "test", onMessage: event(), onStartup: event(), onInstalled: event(),
+      sendMessage: async () => ({ engine: {}, summaries: [] }),
+    },
+    alarms: { create: noop, clear: noop, onAlarm: event() },
     action: { setBadgeText: noop, setBadgeBackgroundColor: noop },
     storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } },
-    tabs: {}, windows: {}, scripting: {}, downloads: { download: noop },
+    tabs: { onUpdated: event(), onRemoved: event() }, windows: {}, scripting: {}, downloads: { download: noop },
   };
 }
 

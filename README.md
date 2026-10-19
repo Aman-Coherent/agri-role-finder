@@ -63,9 +63,26 @@ long run.
    that code allows it (see **business_type** below).
 5. It waits a random 8-15 seconds, then does the next 3.
 6. **CAPTCHA**: the run pauses and brings that tab to the front. You solve
-   it, and the run continues by itself. It never solves one for you. If
-   nobody solves it in 10 minutes, those companies go to `needs_review.csv`
-   and you click **Resume**.
+   it, and the run continues by itself. It never solves one for you. See
+   **When things go wrong** below for the details.
+
+## When things go wrong
+
+| Situation | What the extension does |
+|---|---|
+| **Google shows its CAPTCHA page** ("unusual traffic") | Pauses the whole run, brings that tab to the front, and waits. Once you solve it, Google sends the tab back to the search, the search runs, and the whole run resumes by itself. If Google lands the tab somewhere else (e.g. its home page), the extension re-opens the search itself, at most twice. |
+| **CAPTCHA right on the results page** | Same: pauses, waits for you, resumes. |
+| **Google's cookie-consent page** ("Before you continue") | Same as a CAPTCHA: answer it once in that tab and the run continues. |
+| **CAPTCHA not solved within 10 minutes** | Those companies are marked blocked and the run stays paused. **Resume** searches them again. |
+| **Empty answer, or Google says "Something went wrong"** | Reloads that search once. |
+| **The AI skips a company** in its answer | The company goes back in the queue once and is asked again in a later batch, alongside different companies. Only after a second miss is it recorded not found. |
+| **The AI says NONE** (it has no information) | Recorded not found straight away. The AI looked and didn't know, so asking again rarely helps. |
+| **A tab gets stuck** (page didn't load, internet blip) | After a few minutes it's given up on. Its companies count one missed try (as above) and the run moves on. |
+| **Several searches in a row get no answer at all** (4) | The run **pauses** instead of marking the whole list not found, so you can check what's wrong (internet down, Google not showing AI answers). Click Resume once it's fixed. |
+| **Google folds the answer behind "Show more"** | Clicks it (only buttons, never links), and also reads the hidden text. |
+| **You close a worker tab** mid-search | Nothing is lost: its companies stay queued and get a new tab. If it was the CAPTCHA tab, the run stays paused until Resume. |
+| **Chrome restarts, or the extension is reloaded,** mid-run | The run is paused with a message. **Resume** continues exactly where it stopped. |
+| **Stop** mid-search | The tabs close. Companies that were being searched stay queued for the next Start. |
 
 ## Downloads
 
@@ -143,8 +160,10 @@ extension in `chrome://extensions`.
 
 ## Tests
 
-Offline checks of the list matching, the answer parsing, CSV reading and the
-export split (they don't contact Google):
+Offline checks of the list matching, the answer parsing, CSV reading, the
+export split, and the run engine in every situation in **When things go
+wrong** above (a fake Chrome stands in for the browser; nothing contacts
+Google):
 
 ```
 node --test tests/*.test.js

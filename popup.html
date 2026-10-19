@@ -80,10 +80,16 @@
     Every search asks Google about "Companies per search" companies at once,
     in one structured question - fewer searches for the same list, which is
     both faster and lower-risk (fewer requests from your IP). If a search
-    comes back with no answer at all it is reloaded once, and anything still
-    unresolved is recorded as not found so the run moves straight on to the
-    next batch. Companies are never re-searched one at a time (that was far
-    too slow); use "Retry not-found rows" later to give them another go.
+    comes back with no answer at all it is reloaded once. A company that
+    still gets no answer goes back in the queue once, with different
+    companies, before it is recorded as not found. If several searches in a
+    row get no answer at all, the run pauses so you can check.
+  </div>
+  <div class="hint">
+    <b>CAPTCHA:</b> the run pauses and the tab comes to the front. Solve it
+    there and the run continues by itself. If it isn't solved within 10
+    minutes those companies are marked blocked; <b>Resume</b> searches them
+    again. If Chrome restarts mid-run, the run pauses - click Resume.
   </div>
   <div class="hint">
     <b>Concurrent tabs</b> run that many batches at the same time, so 4 tabs

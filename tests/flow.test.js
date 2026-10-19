@@ -75,6 +75,10 @@ test("background decides on-list vs new itself, and status follows what survives
   assert.strictEqual(describedOnly.description, "A firm.");
 
   assert.strictEqual(bg.sanitizeResultEntry({ itemId: "r2", status: "bogus" }), null);
+  // "No answer this time" passes through as-is for handleResult to retry.
+  assert.deepStrictEqual(plain(bg.sanitizeResultEntry({ itemId: "r3", status: "missing", entities: [{ entity: "Poultry" }] })), {
+    itemId: "r3", status: "missing",
+  });
 });
 
 test("export rows split role by role between the two files, with codes and business types", () => {
