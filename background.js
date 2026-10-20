@@ -115,6 +115,13 @@ const MAX_ATTEMPTS = 2;
 // This many batches in a row with no answer at all pauses the run - see
 // emptyStreakPatch.
 const EMPTY_STREAK_LIMIT = 4;
+// Google caps how many AI answers one account gets in a while ("You've
+// reached the request limit for AI responses at the moment"). When a tab
+// hits it, the whole run pauses for a cool-down and then resumes by itself -
+// longer each time it is hit again in a row, back to the first once answers
+// come through again. See handleAiLimited.
+const AI_LIMIT_ALARM = "arf-ai-cooldown";
+const AI_LIMIT_COOLDOWNS_MIN = [15, 30, 60, 120];
 // How many times the extension may move one batch's tab around while a
 // CAPTCHA is being dealt with - see renavigateWorkerTab. The normal long-
 // query CAPTCHA takes 2 (to the short search, then back to the real one);
@@ -150,7 +157,7 @@ const MAX_ROLES_PER_ENTITY = 15;
 // Message types that must come from our content script running on an
 // actual Google search results tab, vs. types that only the popup should
 // ever send (it has no sender.tab).
-const CONTENT_SCRIPT_TYPES = new Set(["GET_CURRENT", "RESULT", "CAPTCHA_DETECTED", "RETRY_SEARCH"]);
+const CONTENT_SCRIPT_TYPES = new Set(["GET_CURRENT", "RESULT", "CAPTCHA_DETECTED", "RETRY_SEARCH", "AI_LIMITED"]);
 const POPUP_TYPES = new Set([
   "CREATE_PROJECT", "UPDATE_PROJECT_SETTINGS", "RETRY_NOT_FOUND", "DELETE_PROJECT",
   "START", "STOP", "RESUME", "GET_STATE", "GET_PROJECT",
@@ -162,9 +169,14 @@ const DEFAULT_ENGINE = {
   isPaused: false,
   pauseReason: null,
   // Why the run is paused, which decides what may un-pause it on its own:
-  // only a "captcha" pause lifts automatically once every CAPTCHA is dealt
-  // with. "captcha_giveup" | "empty_streak" | "manual" wait for Resume.
+  // a "captcha" pause lifts once every CAPTCHA is dealt with, an "ai_limit"
+  // pause when its cool-down alarm fires. "captcha_giveup" | "empty_streak" |
+  // "manual" wait for Resume.
   pauseKind: null,
+  // Google AI-limit hits in a row (picks the next cool-down) and when the
+  // current cool-down ends - see handleAiLimited.
+  aiLimitHits: 0,
+  resumeAt: null,
   // tabIds of workers currently sitting on an unsolved CAPTCHA or consent
   // page - non-empty implies isPaused. See markNeedsHuman.
   captchaTabIds: [],
@@ -1431,6 +1443,76 @@ async function handleRetrySearch(rawMessage, tabId) {
   armWatchdog(workerIndex, computeWatchdogMs(worker.currentItemIds.length));
 }
 
+function aiLimitPauseReason(resumeAt, minutes) {
+  const at = new Date(resumeAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return (
+    `Google's limit for AI answers has been reached for now ("You've reached the request limit for AI ` +
+    `responses"). The run is paused and resumes by itself at ${at} (in ${minutes} min) - the companies ` +
+    `being searched were not counted as tried. Fewer concurrent tabs (1-2) makes this happen less ` +
+    `often. Click Resume to try sooner.`
+  );
+}
+
+// A tab ran into Google's AI answer limit. That limit is on the whole
+// account, so carrying on would only fail every search - and, worse, record
+// good companies as not found. Instead:
+//   - this batch goes back in the queue untouched (its companies stay
+//     pending, no try counted - nothing was wrong with them);
+//   - the whole run pauses, and a cool-down alarm resumes it by itself
+//     (15, 30, 60, then 120 min if the limit is hit again in a row);
+//   - another tab hitting the same limit during the pause only gives its
+//     batch back - the cool-down isn't restarted or lengthened.
+// Nothing here tries to get round the limit; it waits it out.
+async function handleAiLimited(rawMessage, tabId) {
+  const engine = await getEngine();
+  const workerIndex = workerIndexForTab(engine, tabId);
+  if (workerIndex === -1 || !engine.activeProjectId) return;
+  const worker = engine.workers[workerIndex];
+  if (!(worker.currentItemIds || []).length || rawMessage.batchToken !== worker.batchToken) return; // stale
+  disarmWatchdog(workerIndex);
+
+  const token = worker.batchToken;
+  let cooldownMin = null;
+  const next = await mutateEngine((e) => {
+    const workers = e.workers.slice();
+    if (workers[workerIndex] && workers[workerIndex].batchToken === token) {
+      workers[workerIndex] = { ...workers[workerIndex], currentItemIds: [], currentNames: [], batchToken: null, searchUrl: null };
+    }
+    if (!e.isRunning || (e.isPaused && e.pauseKind === "ai_limit")) return { workers };
+    const hits = (e.aiLimitHits || 0) + 1;
+    cooldownMin = AI_LIMIT_COOLDOWNS_MIN[Math.min(hits, AI_LIMIT_COOLDOWNS_MIN.length) - 1];
+    const resumeAt = Date.now() + cooldownMin * 60000;
+    return {
+      workers, aiLimitHits: hits, resumeAt,
+      isPaused: true, pauseKind: "ai_limit", pauseReason: aiLimitPauseReason(resumeAt, cooldownMin),
+    };
+  });
+  if (cooldownMin) {
+    chrome.alarms.create(AI_LIMIT_ALARM, { delayInMinutes: cooldownMin });
+    console.warn(`[AgriRoleFinder] Google's AI request limit reached - run paused for ${cooldownMin} min`);
+  }
+  updateBadge(next, await getMeta(next.activeProjectId));
+}
+
+// The AI-limit cool-down is over: resume - unless a CAPTCHA turned up in the
+// meantime, which still needs a person first.
+async function handleAiLimitCooldownOver() {
+  let resumeAll = false;
+  const next = await mutateEngine((e) => {
+    if (!e.isRunning || !e.isPaused || e.pauseKind !== "ai_limit") return {};
+    if (e.captchaTabIds.length) {
+      return { pauseKind: "captcha", resumeAt: null, pauseReason: buildCaptchaPauseReason(e.captchaTabIds, e) };
+    }
+    resumeAll = true;
+    return { isPaused: false, pauseKind: null, pauseReason: null, resumeAt: null };
+  });
+  updateBadge(next, await getMeta(next.activeProjectId));
+  if (resumeAll) {
+    console.warn("[AgriRoleFinder] AI-limit cool-down over - resuming the run");
+    wakeAllWorkers(next.workers.length);
+  }
+}
+
 // Applies one worker's full batch result (every company it was claiming,
 // resolved together) in a single pass.
 async function handleResult(rawMessage, tabId) {
@@ -1506,7 +1588,12 @@ async function handleResult(rawMessage, tabId) {
       workers[workerIndex] = { ...workers[workerIndex], currentItemIds: [], batchToken: null, searchUrl: null };
     }
     const neutral = anyBlocked || (!anyAnswered && rawMessage.noAiAnswer === true);
-    const streak = neutral ? {} : emptyStreakPatch(e, anyAnswered);
+    const streak = {
+      ...(neutral ? {} : emptyStreakPatch(e, anyAnswered)),
+      // Answers are coming through again: the next AI-limit hit starts from
+      // the shortest cool-down.
+      ...(anyAnswered ? { aiLimitHits: 0 } : {}),
+    };
     const wasCaptchaTab = e.captchaTabIds.includes(tabId);
     if (!wasCaptchaTab) return { workers, ...streak };
     const captchaTabIds = e.captchaTabIds.filter((id) => id !== tabId);
@@ -1549,6 +1636,7 @@ async function resetAfterRestart(reason, closeOldTabs) {
   const before = await getEngine();
   if (!before.activeProjectId || (!before.isRunning && !before.isPaused)) return;
   clearAllWorkerAlarms(before.workers.length);
+  chrome.alarms.clear(AI_LIMIT_ALARM);
   const after = await mutateEngine((e) => ({
     isRunning: true,
     isPaused: true,
@@ -1590,6 +1678,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === AI_LIMIT_ALARM) {
+    handleAiLimitCooldownOver();
+    return;
+  }
   if (alarm.name.startsWith(WATCHDOG_PREFIX)) {
     const idx = Number(alarm.name.slice(WATCHDOG_PREFIX.length));
     if (Number.isInteger(idx)) handleWatchdogTimeout(idx);
@@ -1675,6 +1767,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ ok: true });
         return;
       }
+      case "AI_LIMITED": {
+        await handleAiLimited(message, sender.tab.id);
+        sendResponse({ ok: true });
+        return;
+      }
       case "RETRY_SEARCH": {
         // "I'm starting another full pass in this same tab" - the in-flight
         // batch needs a fresh watchdog window or the one armed for the first
@@ -1734,6 +1831,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const engineBefore = await getEngine();
         if (engineBefore.activeProjectId === message.projectId && (engineBefore.isRunning || engineBefore.isPaused)) {
           clearAllWorkerAlarms(engineBefore.workers.length);
+          chrome.alarms.clear(AI_LIMIT_ALARM);
           // Engine first, tabs second: closing a tab fires
           // handleWorkerTabClosed, which must find nothing left to reschedule.
           await mutateEngine(() => ({
@@ -1794,6 +1892,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             captchaTabIds: [],
             humanKinds: {},
             emptyStreak: 0,
+            aiLimitHits: 0,
+            resumeAt: null,
             workers,
           };
         });
@@ -1805,11 +1905,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case "STOP": {
         const before = await getEngine();
         clearAllWorkerAlarms(before.workers.length);
+        chrome.alarms.clear(AI_LIMIT_ALARM);
         const stopped = await mutateEngine((engine) => ({
           isRunning: false,
           isPaused: false,
           pauseReason: null,
           pauseKind: null,
+          resumeAt: null,
           captchaTabIds: [],
           humanKinds: {},
           workers: engine.workers.map((w) => ({
@@ -1847,12 +1949,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: false, error: "That project no longer exists." });
           return;
         }
+        chrome.alarms.clear(AI_LIMIT_ALARM); // resuming by hand ends any AI-limit cool-down early
         const resumed = await mutateEngine(() => ({
           isRunning: true,
           isPaused: false,
           pauseReason: null,
           pauseKind: null,
           emptyStreak: 0,
+          resumeAt: null,
         }));
         updateBadge(resumed, project);
         wakeAllWorkers(resumed.workers.length);

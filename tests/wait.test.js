@@ -291,3 +291,40 @@ test("an AI Overview that does answer is used as before - AI Mode is not touched
   assert.strictEqual(page.clicks, 0);
   assert.deepStrictEqual(loaded.sent.find((m) => m.type === "RESULT").results.map((r) => r.status), ["found", "found", "found"]);
 });
+
+// --- Google's AI answer limit ---
+
+const LIMIT_TEXT = "You've reached the request limit for AI responses at the moment. Try again in a little while.";
+
+test("Google's AI limit in AI Mode (the screenshot): reported straight away - no waiting, no reload, nothing written off", async () => {
+  const clock = makeClock();
+  const page = { text: NO_RESULTS_PAGE, clicks: 0 };
+  page.aiModeTab = {
+    onClick() {
+      page.clicks++;
+      page.text = `AI Mode\nI will list 3 agriculture-sector companies...\nThinking`;
+      clock.setTimeout(() => (page.text = `AI Mode\nI will list 3 agriculture-sector companies...\n${LIMIT_TEXT}\nAsk anything`), 4000);
+    },
+  };
+  const loaded = loadPage(clock, page, new Map());
+  loaded.api.runBatch(ITEMS, "b_1");
+  await clock.advance(25000);
+  assert.ok(loaded.sent.some((m) => m.type === "AI_LIMITED" && m.batchToken === "b_1"), "the engine is told");
+  assert.strictEqual(loaded.sent.some((m) => m.type === "RESULT"), false, "no companies reported as missing");
+  assert.strictEqual(loaded.reloads.count, 0, "no reload");
+});
+
+test("the limit on the normal results page is caught the same way", async () => {
+  const clock = makeClock();
+  const loaded = loadPage(clock, { text: `${RESULTS_PAGE}\n${LIMIT_TEXT}` }, new Map());
+  loaded.api.runBatch(ITEMS, "b_1");
+  await clock.advance(2000);
+  assert.ok(loaded.sent.some((m) => m.type === "AI_LIMITED"));
+  assert.strictEqual(loaded.sent.some((m) => m.type === "RESULT"), false);
+});
+
+test("ordinary text mentioning limits is not mistaken for Google's AI limit", () => {
+  const { api } = loadPage(makeClock(), { text: "" }, new Map());
+  assert.strictEqual(api.isAiLimited(LIMIT_TEXT), true);
+  assert.strictEqual(api.isAiLimited("DESCRIPTION: The company sells speed limit signs and AI-based request routing."), false);
+});

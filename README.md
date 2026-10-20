@@ -83,6 +83,7 @@ long run.
 | **CAPTCHA right on the results page** | Same: pauses, waits for you, resumes. |
 | **Google's cookie-consent page** ("Before you continue") | Same as a CAPTCHA: answer it once in that tab and the run continues. |
 | **CAPTCHA not solved within 10 minutes** | Those companies are marked blocked and the run stays paused. **Resume** searches them again. |
+| **Google's AI limit**: "You've reached the request limit for AI responses at the moment" | Google caps how many AI answers one account gets in a while; heavy use (many tabs) reaches it. The run **pauses**, and the batch goes back in the queue with **no try counted**. It **resumes by itself** after a cool-down: 15 min, or 30, 60, then 2 hours if the limit is hit again straight away, going back to 15 once answers come through. The popup shows when it will resume. Click **Resume** to try sooner. Fewer tabs (1–2) makes this much less likely. |
 | **No AI Overview at all**, just normal search results (or "No results found") | After **15 seconds** with no AI Overview, it **clicks the page's "AI Mode" tab**, the same as you would by hand, and reads the answer there. It's the same question and the same checks; AI Mode is built for long questions and usually answers. If AI Mode gives nothing either, it reloads once, then moves on. Those companies get one more try later, in a different batch. These pages never pause the run. |
 | **Empty answer, or Google says "Something went wrong"** | Reloads that search once. |
 | **The AI skips a company** in its answer | The company goes back in the queue once and is asked again in a later batch, alongside different companies. Only after a second miss is it recorded not found. |
@@ -150,8 +151,9 @@ types of the roles in that row, separated by `;`.
 - **Companies per search** (default 3, max 10): more is faster but the
   answer gets longer, so the AI is more likely to skip a company.
 - **Concurrent tabs** (default 1): more is faster but sends more traffic
-  from your IP to Google, so there's a higher risk of a CAPTCHA. 2-4 is a
-  sensible maximum.
+  to Google, so there's a higher risk of a CAPTCHA and of reaching Google's
+  limit for AI answers. **1–2 is recommended**, since AI Mode answers count
+  towards that limit.
 - **Delay min/max**: the wait between searches. Shorter is faster but
   riskier.
 

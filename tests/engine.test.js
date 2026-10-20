@@ -179,6 +179,12 @@ function makeHarness() {
       }
       await settle();
     },
+    // A named alarm going off, through the engine's real alarm listener.
+    async fireAlarm(name) {
+      alarms.delete(name);
+      on.alarm({ name });
+      await settle();
+    },
     async fireWatchdog() {
       alarms.delete("arf-watchdog-0");
       on.alarm({ name: "arf-watchdog-0" });
@@ -628,4 +634,95 @@ test("if Chrome moves the AI Mode page to its unreadable chrome:// page, the tab
   assert.strictEqual(h.tabs.get(tab.id).url, searchUrl);
   await h.answer(answers());
   assert.strictEqual(h.byName("A").status, "found");
+});
+
+// --- Google's AI answer limit ---
+
+async function hitLimit(h) {
+  const tab = h.workerTab();
+  const sender = { tab: { id: tab.id, url: tab.url } };
+  const current = await h.send({ type: "GET_CURRENT" }, sender);
+  await h.send({ type: "AI_LIMITED", batchToken: current.batchToken }, sender);
+  await settle();
+}
+async function fireCooldown(h) {
+  assert.ok(h.alarms.has("arf-ai-cooldown"), "a cool-down timer is set");
+  await h.fireAlarm("arf-ai-cooldown");
+}
+
+test("Google's AI limit pauses the run, gives the batch back untouched, and resumes by itself after the cool-down", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(["A", "B", "C", "D"]));
+  await hitLimit(h);
+
+  assert.strictEqual(h.engine().isPaused, true);
+  assert.strictEqual(h.engine().pauseKind, "ai_limit");
+  assert.match(h.engine().pauseReason, /limit for AI answers.*resumes by itself at .* \(in 15 min\)/);
+  assert.strictEqual(h.alarms.get("arf-ai-cooldown").delayInMinutes, 15);
+  for (const n of ["A", "B", "C"]) {
+    assert.strictEqual(h.byName(n).status, "pending", n);
+    assert.strictEqual(h.byName(n).attempts, 0, `${n}: no try counted`);
+  }
+  assert.deepStrictEqual(h.engine().workers[0].currentItemIds, []);
+
+  await fireCooldown(h);
+  assert.strictEqual(h.engine().isPaused, false, "resumed by itself");
+  assert.deepStrictEqual(await h.answer(answers()), ["A", "B", "C"], "the same companies are searched again");
+  assert.strictEqual(h.engine().aiLimitHits, 0, "a real answer resets the cool-down ladder");
+});
+
+test("hitting the limit again straight after waits longer each time: 15, 30, 60, then 120 min", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(Array.from({ length: 6 }, (_, i) => `C${i}`)));
+  const waits = [];
+  for (let i = 0; i < 5; i++) {
+    await hitLimit(h);
+    waits.push(h.alarms.get("arf-ai-cooldown").delayInMinutes);
+    await fireCooldown(h);
+  }
+  assert.deepStrictEqual(waits, [15, 30, 60, 120, 120]);
+});
+
+test("a second tab hitting the same limit during the pause doesn't restart or lengthen the cool-down", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(["A", "B", "C"]));
+  const tabId = h.workerTab().id;
+  await hitLimit(h);
+  const firstResumeAt = h.engine().resumeAt;
+  h.alarms.delete("arf-ai-cooldown");
+  // Another tab still had a batch in flight when the pause began; it now
+  // runs into the same limit.
+  await h.ctx.mutateEngine((e) => {
+    const workers = e.workers.slice();
+    workers[0] = { ...workers[0], tabId, currentItemIds: ["r0", "r1"], currentNames: ["A", "B"], batchToken: "b_other" };
+    return { workers };
+  });
+  await h.send({ type: "AI_LIMITED", batchToken: "b_other" }, { tab: { id: tabId, url: h.tabs.get(tabId).url } });
+  await settle();
+  assert.deepStrictEqual(h.engine().workers[0].currentItemIds, [], "its batch is given back too");
+  assert.strictEqual(h.engine().resumeAt, firstResumeAt, "cool-down not restarted");
+  assert.strictEqual(h.engine().aiLimitHits, 1, "not counted as a second hit");
+  assert.strictEqual(h.alarms.has("arf-ai-cooldown"), false, "no new timer");
+});
+
+test("clicking Resume during the cool-down resumes now and cancels the timer", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(["A", "B", "C"]));
+  await hitLimit(h);
+  await h.send({ type: "RESUME" });
+  await settle();
+  assert.strictEqual(h.engine().isPaused, false);
+  assert.strictEqual(h.alarms.has("arf-ai-cooldown"), false);
+});
+
+test("if a CAPTCHA is still unsolved when the cool-down ends, the run stays paused for the CAPTCHA", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(["A", "B", "C"]));
+  h.navigate(h.workerTab().id, SORRY); // CAPTCHA first
+  await settle();
+  await h.ctx.mutateEngine(() => ({ pauseKind: "ai_limit" })); // then the AI limit took over the pause
+  await h.fireAlarm("arf-ai-cooldown");
+  assert.strictEqual(h.engine().isPaused, true);
+  assert.strictEqual(h.engine().pauseKind, "captcha");
+  assert.match(h.engine().pauseReason, /CAPTCHA showing/);
 });

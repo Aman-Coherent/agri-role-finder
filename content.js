@@ -289,6 +289,17 @@
     return /\bAI Overview\b/.test(text || "");
   }
 
+  // Google's own "you've used up your AI answers for now" message, e.g. in AI
+  // Mode: "You've reached the request limit for AI responses at the moment.
+  // Try again in a little while." That limit is on the whole account, not
+  // this search - so it is reported to background.js, which pauses the run
+  // and resumes after a cool-down (see handleAiLimited), instead of being
+  // treated as "no answer" and writing these companies off.
+  const AI_LIMIT_RE = /\b(reached|hit|exceeded)\s+(?:the|your)\s+(?:daily\s+)?(?:request\s+)?limit\s+for\s+AI\b|\brequest\s+limit\s+for\s+AI\s+(?:responses|answers|mode)\b/i;
+  function isAiLimited(text) {
+    return AI_LIMIT_RE.test(text || "");
+  }
+
   // --- Parsing the answer ---
 
   const INVISIBLE_CHARS_RE = new RegExp("[\\u200B\\u200C\\u200D\\uFEFF]", "g");
@@ -535,6 +546,7 @@
         expandCollapsedAnswer();
         const text = pageText();
         if (/something went wrong/i.test(text)) return finish("error");
+        if (isAiLimited(text)) return finish("ai_limit");
         if (readyFn(text)) return finish("ready");
         if (Date.now() - startedAt >= NO_AI_ANSWER_MS && noAnswerFn(text)) return finish("no_ai");
         if (text.length !== lastLength) {
@@ -664,6 +676,16 @@
     // A CAPTCHA that appeared mid-wait: hand it to a human, then give the
     // answer another full wait if it clears, rather than throwing the batch
     // away over an interruption that has since been resolved.
+    // Google's AI answer limit: not this batch's fault, and nothing to be
+    // read until it lifts. Hand it to background.js (pause + cool-down) and
+    // stop - no reload, no AI Mode click, nothing counted against the
+    // companies.
+    if (outcome === "ai_limit" || (outcome !== "ready" && isAiLimited(pageText()))) {
+      debug(`runBatch: Google's AI request limit reached (${inAiMode ? "AI Mode" : "results page"}) - pausing the run`);
+      chrome.runtime.sendMessage({ type: "AI_LIMITED", batchToken });
+      return;
+    }
+
     if (outcome === "blocked") {
       const solved = await waitForCaptchaSolved(batchToken);
       if (!solved) {
@@ -759,7 +781,7 @@
   // Exposed for the offline parser tests only (see tests/). In the extension
   // this script is never loaded as a module, so this branch never runs.
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { parseAnswer, parseBlock, answeredCount, waitForAnswer, isStillGenerating, hasAiAnswerSign, findAiModeTab, runBatch };
+    module.exports = { parseAnswer, parseBlock, answeredCount, waitForAnswer, isStillGenerating, hasAiAnswerSign, isAiLimited, findAiModeTab, runBatch };
     return;
   }
 
