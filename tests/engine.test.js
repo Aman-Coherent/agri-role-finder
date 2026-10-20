@@ -657,8 +657,8 @@ test("Google's AI limit pauses the run, gives the batch back untouched, and resu
 
   assert.strictEqual(h.engine().isPaused, true);
   assert.strictEqual(h.engine().pauseKind, "ai_limit");
-  assert.match(h.engine().pauseReason, /limit for AI answers.*resumes by itself at .* \(in 15 min\)/);
-  assert.strictEqual(h.alarms.get("arf-ai-cooldown").delayInMinutes, 15);
+  assert.match(h.engine().pauseReason, /limit for AI answers.*resumes by itself at .* \(in 5 min\)/);
+  assert.strictEqual(h.alarms.get("arf-ai-cooldown").delayInMinutes, 5);
   for (const n of ["A", "B", "C"]) {
     assert.strictEqual(h.byName(n).status, "pending", n);
     assert.strictEqual(h.byName(n).attempts, 0, `${n}: no try counted`);
@@ -671,16 +671,16 @@ test("Google's AI limit pauses the run, gives the batch back untouched, and resu
   assert.strictEqual(h.engine().aiLimitHits, 0, "a real answer resets the cool-down ladder");
 });
 
-test("hitting the limit again straight after waits longer each time: 15, 30, 60, then 120 min", async () => {
+test("hitting the limit again straight after waits longer each time: 5, 10, 20, 40, then 60 min", async () => {
   const h = makeHarness();
   await h.start(await h.create(Array.from({ length: 6 }, (_, i) => `C${i}`)));
   const waits = [];
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 6; i++) {
     await hitLimit(h);
     waits.push(h.alarms.get("arf-ai-cooldown").delayInMinutes);
     await fireCooldown(h);
   }
-  assert.deepStrictEqual(waits, [15, 30, 60, 120, 120]);
+  assert.deepStrictEqual(waits, [5, 10, 20, 40, 60, 60]);
 });
 
 test("a second tab hitting the same limit during the pause doesn't restart or lengthen the cool-down", async () => {

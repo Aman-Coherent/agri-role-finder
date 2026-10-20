@@ -121,11 +121,13 @@ const MAX_ATTEMPTS = 2;
 const EMPTY_STREAK_LIMIT = 4;
 // Google caps how many AI answers one account gets in a while ("You've
 // reached the request limit for AI responses at the moment"). When a tab
-// hits it, the whole run pauses for a cool-down and then resumes by itself -
-// longer each time it is hit again in a row, back to the first once answers
-// come through again. See handleAiLimited.
+// hits it, the whole run pauses for a cool-down and then resumes by itself.
+// The first wait is short - Google only says "a little while" - and each hit
+// in a row doubles it, so a limit that hasn't lifted isn't asked about every
+// few minutes; back to the first once answers come through again. See
+// handleAiLimited.
 const AI_LIMIT_ALARM = "arf-ai-cooldown";
-const AI_LIMIT_COOLDOWNS_MIN = [15, 30, 60, 120];
+const AI_LIMIT_COOLDOWNS_MIN = [5, 10, 20, 40, 60];
 // How many times the extension may move one batch's tab around while a
 // CAPTCHA is being dealt with - see renavigateWorkerTab. The normal long-
 // query CAPTCHA takes 2 (to the short search, then back to the real one);
@@ -1474,7 +1476,7 @@ function aiLimitPauseReason(resumeAt, minutes) {
 //   - this batch goes back in the queue untouched (its companies stay
 //     pending, no try counted - nothing was wrong with them);
 //   - the whole run pauses, and a cool-down alarm resumes it by itself
-//     (15, 30, 60, then 120 min if the limit is hit again in a row);
+//     (5, 10, 20, 40, then 60 min if the limit is hit again in a row);
 //   - another tab hitting the same limit during the pause only gives its
 //     batch back - the cool-down isn't restarted or lengthened.
 // Nothing here tries to get round the limit; it waits it out.
