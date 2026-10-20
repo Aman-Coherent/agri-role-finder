@@ -756,3 +756,45 @@ test("a 15-company batch is answered and read in full", async () => {
   assert.strictEqual((await h.answer(answers())).length, 15);
   assert.ok(h.items().every((c) => c.status === "found"));
 });
+
+// --- A CAPTCHA solved after the 10-minute give-up ---
+
+test("a CAPTCHA solved after the 10-minute give-up resumes the run by itself (the 'stuck on agriculture companies' report)", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(["A", "B", "C", "D"]));
+  const tab = h.workerTab();
+  const longSorry = `https://www.google.com/sorry/index?continue=${encodeURIComponent(tab.url)}&q=token`;
+  const landing = "https://www.google.com/search?q=agriculture%20companies&hl=en&pws=0";
+  h.setRedirect((u) => (u === landing ? `https://www.google.com/sorry/index?continue=${encodeURIComponent(landing)}` : null));
+  h.navigate(tab.id, longSorry);
+  await settle();
+  assert.match(h.tabs.get(tab.id).url, /\/sorry\/index\?continue=.*agriculture/, "on the short search's CAPTCHA");
+
+  await h.fireWatchdog(); // nobody solved it within 10 minutes
+  assert.strictEqual(h.engine().pauseKind, "captcha_giveup");
+  assert.strictEqual(h.byName("A").status, "blocked");
+
+  // ...then it is solved: Google returns to the stand-in search with its exemption token.
+  h.setRedirect(null);
+  h.navigate(tab.id, `${landing}&google_abuse=GOOGLE_ABUSE_EXEMPTION%3DID%3D438aa6dd63719147`);
+  await settle();
+
+  assert.strictEqual(h.engine().isPaused, false, "the run resumes - solving it late still counts");
+  assert.strictEqual(h.byName("A").status, "pending", "the blocked companies go back in the queue");
+  assert.ok(h.tabs.get(tab.id).url.startsWith(SEARCH) && !h.tabs.get(tab.id).url.includes("agriculture%20companies"),
+    "and the tab moves on to a real search");
+});
+
+test("during a CAPTCHA give-up pause, an ordinary page load does not resume the run by accident", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(["A", "B", "C"]));
+  const tab = h.workerTab();
+  h.navigate(tab.id, SORRY);
+  await settle();
+  await h.fireWatchdog();
+  assert.strictEqual(h.engine().pauseKind, "captcha_giveup");
+  h.navigate(tab.id, `${SEARCH}something+else`); // no exemption token, not the stand-in search
+  await settle();
+  assert.strictEqual(h.engine().isPaused, true, "still waiting for Resume");
+  assert.strictEqual(h.byName("A").status, "blocked");
+});

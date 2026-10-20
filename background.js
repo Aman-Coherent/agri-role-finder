@@ -1359,6 +1359,24 @@ async function handleWorkerTabUrl(tabId, url, isUrlChange) {
   const workerIndex = workerIndexForTab(engine, tabId);
   if (workerIndex === -1) return;
   const worker = engine.workers[workerIndex];
+
+  // A CAPTCHA solved AFTER the 10-minute give-up. By then this tab's batch
+  // was marked blocked and handed back, and the run paused for Resume - so
+  // without this, solving it late left the tab sitting on the page Google
+  // returns to (the stand-in "agriculture companies" search, typically) and
+  // the run paused for good. Google's redirect after a solved CAPTCHA
+  // carries its google_abuse exemption token, and the stand-in search is
+  // only ever reached via a CAPTCHA; either means it really was solved, so
+  // it counts exactly like pressing Resume.
+  if (
+    isUrlChange && engine.isRunning && engine.isPaused && engine.pauseKind === "captcha_giveup" &&
+    isGoogleSearchUrl(url) && (/[?&]google_abuse=/.test(url) || isCaptchaLandingUrl(url))
+  ) {
+    console.warn(`[AgriRoleFinder] worker ${workerIndex}: CAPTCHA solved after the give-up - resuming the run`);
+    await resumeRun();
+    return;
+  }
+
   if (!(worker.currentItemIds || []).length) return;
   const waiting = engine.captchaTabIds.includes(tabId);
 
@@ -1641,6 +1659,33 @@ async function handleResult(rawMessage, tabId) {
   if (newEngine.isRunning && !newEngine.isPaused) {
     scheduleNext(workerIndex, randomDelayMs(project));
   }
+}
+
+// What the Resume button does - and what a CAPTCHA solved after the
+// 10-minute give-up does too (see handleWorkerTabUrl).
+async function resumeRun() {
+  const engineBefore = await getEngine();
+  // Blocked companies were never answered - a CAPTCHA got in the way, which
+  // says nothing about the company - so resuming searches them again rather
+  // than leaving them for a manual pass.
+  const { meta: project } = engineBefore.activeProjectId
+    ? await updateItemsWithStatus(engineBefore.activeProjectId, "blocked", (item) => {
+        item.status = "pending";
+      })
+    : { meta: null };
+  if (!project) return { ok: false, error: "That project no longer exists." };
+  chrome.alarms.clear(AI_LIMIT_ALARM); // resuming ends any AI-limit cool-down early
+  const resumed = await mutateEngine(() => ({
+    isRunning: true,
+    isPaused: false,
+    pauseReason: null,
+    pauseKind: null,
+    emptyStreak: 0,
+    resumeAt: null,
+  }));
+  updateBadge(resumed, project);
+  wakeAllWorkers(resumed.workers.length);
+  return { ok: true };
 }
 
 // Chrome restarted, or the extension was reloaded/updated, mid-run. Every
@@ -1953,31 +1998,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
       case "RESUME": {
-        const engineBefore = await getEngine();
-        // Blocked companies were never answered - a CAPTCHA got in the way,
-        // which says nothing about the company - so resuming searches them
-        // again rather than leaving them for a manual pass.
-        const { meta: project } = engineBefore.activeProjectId
-          ? await updateItemsWithStatus(engineBefore.activeProjectId, "blocked", (item) => {
-              item.status = "pending";
-            })
-          : { meta: null };
-        if (!project) {
-          sendResponse({ ok: false, error: "That project no longer exists." });
-          return;
-        }
-        chrome.alarms.clear(AI_LIMIT_ALARM); // resuming by hand ends any AI-limit cool-down early
-        const resumed = await mutateEngine(() => ({
-          isRunning: true,
-          isPaused: false,
-          pauseReason: null,
-          pauseKind: null,
-          emptyStreak: 0,
-          resumeAt: null,
-        }));
-        updateBadge(resumed, project);
-        wakeAllWorkers(resumed.workers.length);
-        sendResponse({ ok: true });
+        sendResponse(await resumeRun());
         return;
       }
       case "GET_STATE": {
