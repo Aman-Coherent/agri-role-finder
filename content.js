@@ -85,9 +85,10 @@
   // load time, or the watchdog fires first and marks the whole in-flight
   // batch not_found before this script ever reports a real answer. If you
   // raise these, raise those too.
+  // No overall cap: a big batch's answer is long and takes AI Mode longer to
+  // write, and the companies-per-search setting has no maximum.
   const ANSWER_BASE_MS = 60000;
   const ANSWER_PER_ITEM_MS = 20000;
-  const ANSWER_MAX_MS = 240000;
   // The wait is driven by whether the PAGE IS STILL PRODUCING OUTPUT, not by
   // elapsed time: while the text keeps changing the wait keeps going (up to
   // the cap above). How much silence counts as "finished" depends on what is
@@ -338,7 +339,7 @@
   // A line that opens with a label, tolerating whatever Google or the AI puts
   // in front of it: a bullet, a dash, markdown asterisks, a heading "#".
   const LABEL_PREFIX = "^[\\s>#*\\-–•]*";
-  const MARKER_RE = new RegExp(`${LABEL_PREFIX}COMPANY\\s*(?:#|no\\.?|number)?\\s*(\\d{1,2})\\b[^\\n]*`, "gim");
+  const MARKER_RE = new RegExp(`${LABEL_PREFIX}COMPANY\\s*(?:#|no\\.?|number)?\\s*(\\d{1,3})\\b[^\\n]*`, "gim");
   const END_RE = new RegExp(`${LABEL_PREFIX}END\\s+OF\\s+ANSWERS\\b`, "gim");
   const DESCRIPTION_RE = new RegExp(`${LABEL_PREFIX}DESCRIPTION\\s*\\**\\s*:\\s*(.*)$`, "i");
   const ENTITY_RE = new RegExp(`${LABEL_PREFIX}ENTITY\\s*\\**\\s*:\\s*(.*)$`, "i");
@@ -656,7 +657,7 @@
     // step - and so a batch only ever tries AI Mode once.
     const aiModeKey = `arfAiMode_${batchToken}`;
     const inAiMode = sessionStorage.getItem(aiModeKey) === "1";
-    const waitMs = Math.min(ANSWER_BASE_MS + ANSWER_PER_ITEM_MS * n, ANSWER_MAX_MS);
+    const waitMs = ANSWER_BASE_MS + ANSWER_PER_ITEM_MS * n;
     const started = Date.now();
     const readyFn = (text) => {
       const parsed = parseAnswer(text, n);

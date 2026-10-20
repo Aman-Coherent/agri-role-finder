@@ -726,3 +726,33 @@ test("if a CAPTCHA is still unsolved when the cool-down ends, the run stays paus
   assert.strictEqual(h.engine().pauseKind, "captcha");
   assert.match(h.engine().pauseReason, /CAPTCHA showing/);
 });
+
+// --- No maximum on companies per search ---
+
+test("companies per search has no maximum", () => {
+  const h = makeHarness();
+  assert.strictEqual(h.ctx.clampBatchSize(50), 50);
+  assert.strictEqual(h.ctx.clampBatchSize(0), 3, "0 / empty falls back to the default");
+  assert.strictEqual(h.ctx.clampBatchSize(-4), 1);
+});
+
+test("a batch too big for one Google link is fitted to what the link can carry; the rest wait for the next search", async () => {
+  const h = makeHarness();
+  const names = Array.from({ length: 300 }, (_, i) => `Example Agro Industries Private Limited ${i}`);
+  await h.start(await h.create(names, { batchSize: 300 }));
+  const first = h.engine().workers[0];
+  assert.ok(first.searchUrl.length <= 29000, `link is ${first.searchUrl.length} characters`);
+  assert.ok(first.currentItemIds.length > 50 && first.currentItemIds.length < 300, `claimed ${first.currentItemIds.length}`);
+  const claimed = first.currentItemIds.length;
+  await h.answer(answers());
+  await h.nextBatch();
+  assert.strictEqual(h.engine().workers[0].currentItemIds[0], `r${claimed}`, "the next search carries on where that one stopped");
+});
+
+test("a 15-company batch is answered and read in full", async () => {
+  const h = makeHarness();
+  const names = Array.from({ length: 15 }, (_, i) => `C${i}`);
+  await h.start(await h.create(names, { batchSize: 15 }));
+  assert.strictEqual((await h.answer(answers())).length, 15);
+  assert.ok(h.items().every((c) => c.status === "found"));
+});

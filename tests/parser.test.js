@@ -149,3 +149,12 @@ test("without COMPANY lines, descriptions are paired in order only when the coun
   // One company short: too ambiguous to pair - nothing is guessed.
   assert.strictEqual(parseAnswer(unmarked, 4).blocks.size, 0);
 });
+
+test("company numbers above 99 are read (batches have no maximum size)", () => {
+  const text = [99, 100, 101]
+    .map((i) => `COMPANY ${i}\nDESCRIPTION: Company ${i}.\nENTITY: Poultry | ROLES: Hatchery [Manufacturer]`)
+    .join("\n") + "\nEND OF ANSWERS";
+  const p = parseAnswer(text, 101);
+  assert.strictEqual(p.blocks.get(100).description, "Company 100.");
+  assert.strictEqual(p.blocks.get(101).entities[0].entity, "Poultry");
+});

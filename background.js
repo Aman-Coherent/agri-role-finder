@@ -81,8 +81,8 @@ const WATCHDOG_PREFIX = "arf-watchdog-";
 // extension can't extract anything". Answers here are much longer than the
 // sibling extension's one-line-per-company replies (a description plus
 // several entity lines each), so both sides allow more per company.
-// content.js caps a 3-company batch at 120s and a 10-company one at 240s;
-// this leaves roughly a 2x margin on top of that.
+// content.js waits at most 60s + 20s per company (120s for 3, 260s for 10);
+// this stays well above that at every batch size (80s + 20s per company more).
 const BASE_WATCHDOG_MS = 180000;
 const PER_ITEM_WATCHDOG_MS = 40000;
 function computeWatchdogMs(batchLength) {
@@ -102,7 +102,11 @@ const NUDGE_GRACE_MS = 20000;
 const COMPLETION_LOG_SIZE = 30;
 const MAX_CONCURRENCY = 20;
 const MIN_BATCH_SIZE = 1;
-const MAX_BATCH_SIZE = 10; // higher risks the query getting too long / the AI dropping companies from a longer list
+// No upper limit on companies per search - that trade-off is the user's: a
+// bigger batch means fewer searches (and fewer AI requests against Google's
+// limit), but a longer answer the AI is more likely to cut short; companies
+// it skips get their second try in a later batch. The one hard ceiling is
+// technical - see MAX_SEARCH_URL_LEN.
 // Lower than the sibling extension's 5: every company's answer here is a
 // description plus several entity lines, so a batch answer is several times
 // longer and the AI is more likely to cut it short.
@@ -226,8 +230,15 @@ function clampConcurrency(n) {
 
 function clampBatchSize(n) {
   const v = Math.round(Number(n) || DEFAULT_BATCH_SIZE);
-  return Math.max(MIN_BATCH_SIZE, Math.min(v, MAX_BATCH_SIZE));
+  return Math.max(MIN_BATCH_SIZE, v);
 }
+
+// The longest search link this extension will send. Every company adds ~100-
+// 150 characters to the ~13,600 the question itself takes; Google was
+// checked to accept links up to ~29,000. A batch whose link would be longer
+// is claimed with as many companies as fit - the rest simply wait for the
+// next search - rather than sending a request Google may reject outright.
+const MAX_SEARCH_URL_LEN = 29000;
 
 // ---------------------------------------------------------------------------
 // Project storage - in pieces of ARF_STORE.CHUNK_SIZE companies; see store.js
@@ -1009,6 +1020,10 @@ async function processNext(workerIndex) {
     if (!pending.length) return {};
     claimed = pending;
     searchUrl = buildSearchUrl(claimed);
+    while (searchUrl.length > MAX_SEARCH_URL_LEN && claimed.length > 1) {
+      claimed = claimed.slice(0, -1);
+      searchUrl = buildSearchUrl(claimed);
+    }
     const workers = engine.workers.slice();
     workers[workerIndex] = {
       ...workers[workerIndex],

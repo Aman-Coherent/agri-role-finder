@@ -148,8 +148,12 @@ types of the roles in that row, separated by `;`.
 
 ## Settings
 
-- **Companies per search** (default 3, max 10): more is faster but the
-  answer gets longer, so the AI is more likely to skip a company.
+- **Companies per search** (default 3, no maximum): more means fewer
+  searches, so it's faster and uses fewer of Google's AI answers. But the
+  answer gets longer, so the AI is more likely to cut it short or skip a
+  company; skipped companies get their second try in a later batch. Very
+  large numbers are fitted automatically to what one Google search link can
+  carry (about 85 companies).
 - **Concurrent tabs** (default 1): more is faster but sends more traffic
   to Google, so there's a higher risk of a CAPTCHA and of reaching Google's
   limit for AI answers. **1–2 is recommended**, since AI Mode answers count
