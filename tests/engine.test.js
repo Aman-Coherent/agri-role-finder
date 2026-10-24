@@ -143,7 +143,7 @@ function makeHarness() {
       for (const { n, items } of chunks) store[ARF_STORE.chunkKey(projectId, n)] = structuredClone(items);
       const res = await send({
         type: "CREATE_PROJECT", projectId, name: "Test", total: names.length, chunkCount: chunks.length,
-        batchSize: opts.batchSize || 3, concurrency: 1, delayMinSec: 2, delayMaxSec: 3,
+        batchSize: opts.batchSize || 3, concurrency: 1, delayMinSec: 2, delayMaxSec: 3, fields: opts.fields,
       });
       assert.ok(res && res.ok, `project created: ${JSON.stringify(res)}`);
       return res.projectId;
@@ -797,4 +797,29 @@ test("during a CAPTCHA give-up pause, an ordinary page load does not resume the 
   await settle();
   assert.strictEqual(h.engine().isPaused, true, "still waiting for Resume");
   assert.strictEqual(h.byName("A").status, "blocked");
+});
+
+// --- What to find ---
+
+test("a Description-only project sends the short question and counts a description as found", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(["A", "B", "C"], { fields: ["description"] }));
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(h.project().fields)), ["description"]);
+  const q = new URL(h.workerTab().url).searchParams.get("q");
+  assert.doesNotMatch(q, /LIST|ENTITY/);
+  assert.ok(q.length < 2000, `question is ${q.length} characters`);
+  await h.answer((items) =>
+    items.map((it, i) => `COMPANY ${i + 1}\nDESCRIPTION: ${it.company_name} makes things.`).join("\n") + "\nEND OF ANSWERS"
+  );
+  for (const n of ["A", "B", "C"]) {
+    assert.strictEqual(h.byName(n).status, "found", n);
+    assert.strictEqual(h.byName(n).description, `${n} makes things.`);
+  }
+});
+
+test("a project without a choice (or made before the choice existed) asks for everything", async () => {
+  const h = makeHarness();
+  await h.start(await h.create(["A"]));
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(h.project().fields)), ["description", "entities", "roles", "businessType"]);
+  assert.match(new URL(h.workerTab().url).searchParams.get("q"), /LIST - each line is an entity/);
 });

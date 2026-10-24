@@ -36,6 +36,8 @@
       display: none; margin-top: 8px; padding: 8px; background: #f4f4f4; border-radius: 4px;
     }
     #newProjectNameInput { width: 100%; box-sizing: border-box; padding: 5px; margin-bottom: 6px; }
+    .fieldChoices { margin-top: 4px; }
+    .fieldChoices label { display: inline-block; font-weight: normal; margin: 0 12px 0 0; }
   </style>
 </head>
 <body>
@@ -55,6 +57,15 @@
   </div>
 
   <div id="engineBanner"></div>
+
+  <label>What to find</label>
+  <div class="fieldChoices">
+    <label><input type="checkbox" class="fieldChoice" value="description" checked /> Description</label>
+    <label><input type="checkbox" class="fieldChoice" value="entities" checked /> Entities</label>
+    <label><input type="checkbox" class="fieldChoice" value="roles" checked /> Roles</label>
+    <label><input type="checkbox" class="fieldChoice" value="businessType" checked /> Business type</label>
+  </div>
+  <div class="hint" id="fieldsHint"></div>
 
   <div class="row">
     <div>
@@ -128,9 +139,10 @@
   <div>
     <button id="exportOnList">Download on_list_results.csv</button>
     <button id="exportNew">Download new_results.csv</button>
+    <button id="exportResults" style="display:none;">Download results.csv</button>
   </div>
   <div class="hint">
-    One row per company + entity. <b>on_list_results</b> has only entities and
+    <span id="exportHintText">One row per company + entity.</span> <b>on_list_results</b> has only entities and
     roles from your list; <b>new_results</b> has entities and roles the AI
     found that are not on your list. A company can appear in both.
   </div>

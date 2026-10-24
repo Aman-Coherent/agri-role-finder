@@ -432,6 +432,11 @@ function createProjectFromChunks(message) {
       // Which input header each field was read from - shown in the popup so
       // a wrong auto-detection is visible before a long run, not after.
       detected,
+      // What this project asks for - fixed for its whole life, so one
+      // project never mixes answers to two different questions. A project
+      // made before this choice existed has none stored and is treated as
+      // "everything", which is what it was asked.
+      fields: normalizeFields(message.fields),
       total,
       chunkCount,
       chunkCounts,
@@ -601,7 +606,18 @@ function describeCompany(item) {
 //     against the role's code (resolveBusinessTypes).
 //   - "Write NONE instead of guessing" is the main defence against a
 //     generative answer inventing plausible-sounding activities.
-function buildPrompt(items) {
+// What a project asks for (its fields) decides the question: any of
+// entities/roles/business types needs the full question (buildFullPrompt,
+// unchanged), and those ticks only decide which columns are exported;
+// Description alone asks a shorter one (buildDescriptionPrompt). The field
+// list and rules live in store.js, shared with the popup.
+const { normalizeFields, needsClassification } = ARF_STORE;
+
+// The sentences both questions share, kept as single strings so the
+// description part of a description-only question is word-for-word the one
+// the full question asks - the same instruction gets the same quality of
+// description either way.
+function promptIntro(items) {
   const n = items.length;
   const companyLines = items.map((it, i) => `${i + 1}) ${describeCompany(it)}`).join("\n");
   return (
@@ -610,9 +626,33 @@ function buildPrompt(items) {
     `the company and what it does; if no website is given, identify the company by ` +
     `its name and location.\n\n` +
     `Companies:\n${companyLines}\n\n` +
-    `For each company:\n` +
-    `(a) Write a factual description of what the company actually does - its main ` +
-    `products or services and who it sells to - in 2 to 3 sentences, on ONE line.\n` +
+    `For each company:\n`
+  );
+}
+const DESCRIPTION_TASK =
+  `(a) Write a factual description of what the company actually does - its main ` +
+  `products or services and who it sells to - in 2 to 3 sentences, on ONE line.\n`;
+const REPLY_FORMAT_START =
+  `Reply in exactly this format and nothing else - no greeting, no explanation, ` +
+  `no markdown, no tables:\n` +
+  `COMPANY <number>\n` +
+  `DESCRIPTION: <2-3 sentences on one line>\n`;
+const ORDER_AND_END =
+  `Use the same ` +
+  `company numbers as above, keep the same order, and do not skip any company. ` +
+  `After the last company, write one final line: END OF ANSWERS\n`;
+
+function buildPrompt(items, fields) {
+  return needsClassification(fields) ? buildFullPrompt(items) : buildDescriptionPrompt(items);
+}
+
+// The full question - description, entities, roles and business types.
+// Unchanged by the per-project field choice: tests/fixtures holds a copy of
+// its exact output, and a test fails if a single character changes.
+function buildFullPrompt(items) {
+  return (
+    promptIntro(items) +
+    DESCRIPTION_TASK +
     `(b) Choose every ENTITY from the list below that the company belongs to, and ` +
     `under each entity every ROLE from that entity's own roles that the company ` +
     `actually performs. Copy entity and role names EXACTLY as written in the list. ` +
@@ -624,14 +664,10 @@ function buildPrompt(items) {
     `${ARF_TAXONOMY.BUSINESS_TYPES.join(", ")}. Pick the specific one - for example ` +
     `Exporter, not Exporter/Importer; Distributor, not Distributor/Wholesaler. If it ` +
     `is more than one, separate them with commas inside the brackets.\n\n` +
-    `Reply in exactly this format and nothing else - no greeting, no explanation, ` +
-    `no markdown, no tables:\n` +
-    `COMPANY <number>\n` +
-    `DESCRIPTION: <2-3 sentences on one line>\n` +
+    REPLY_FORMAT_START +
     `ENTITY: <entity name> | ROLES: <role> [<business type>]; <role> [<business type>]\n` +
-    `Write one ENTITY line for each entity the company belongs to. Use the same ` +
-    `company numbers as above, keep the same order, and do not skip any company. ` +
-    `After the last company, write one final line: END OF ANSWERS\n` +
+    `Write one ENTITY line for each entity the company belongs to. ` +
+    ORDER_AND_END +
     `If you cannot find reliable information about a company, write DESCRIPTION: NONE ` +
     `and ENTITY: NONE for it instead of guessing - never invent what a company does.\n\n` +
     // The long list goes LAST: if Google ever cuts a very long query short,
@@ -639,6 +675,23 @@ function buildPrompt(items) {
     // without which no answer could be read at all.
     `LIST - each line is an entity, a colon, then that entity's roles separated by semicolons:\n` +
     `${ARF_TAXONOMY.promptList()}`
+  );
+}
+
+// Description only: the full question minus the entity/role/business-type
+// parts and the entity list - every sentence it keeps is the full question's
+// own. About a fifth of the length, so it gets an AI Overview more often and
+// uses less of Google's AI-answer allowance. Same reply format (COMPANY /
+// DESCRIPTION / END OF ANSWERS), so the same answer reader handles it.
+function buildDescriptionPrompt(items) {
+  return (
+    promptIntro(items) +
+    DESCRIPTION_TASK +
+    `\n` +
+    REPLY_FORMAT_START +
+    ORDER_AND_END +
+    `If you cannot find reliable information about a company, write DESCRIPTION: NONE ` +
+    `for it instead of guessing - never invent what a company does.`
   );
 }
 
@@ -662,8 +715,8 @@ function buildPrompt(items) {
 //   &hl=en  - keep the answer's language (and so its labels) predictable
 //   &pws=0  - no personalized results, so what's scraped doesn't depend on
 //             this browser profile's search history
-function buildSearchUrl(items) {
-  return `https://www.google.com/search?q=${encodeURIComponent(buildPrompt(items))}&hl=en&pws=0`;
+function buildSearchUrl(items, fields) {
+  return `https://www.google.com/search?q=${encodeURIComponent(buildPrompt(items, fields))}&hl=en&pws=0`;
 }
 
 function isGoogleUrl(url) {
@@ -754,11 +807,14 @@ function sanitizeName(value) {
 // decided: the raw entity/role names go through ARF_TAXONOMY.classify, so the
 // AI's own claim that a name came from the list is never what decides it.
 //
-// Status is re-derived rather than taken from the message: "found" means at
-// least one entity survived all of the above. A company with a description
-// but no entity at all is not_found (its description is still kept), since it
-// has nothing to put in either results file.
-function sanitizeResultEntry(entry) {
+// Status is re-derived rather than taken from the message, from what the
+// project asked for (its fields - see ALL_FIELDS in store.js):
+//   - entities/roles/business types asked for (the full question): "found"
+//     means at least one entity survived all of the above. A company with a
+//     description but no entity at all is not_found (its description is still
+//     kept), since it has nothing to put in either results file.
+//   - description only: "found" means a description came back.
+function sanitizeResultEntry(entry, fields) {
   if (!entry || typeof entry.itemId !== "string") return null;
   if (!ALLOWED_STATUSES.has(entry.status)) return null;
   if (entry.status === "blocked" || entry.status === "missing") return { itemId: entry.itemId, status: entry.status };
@@ -771,9 +827,10 @@ function sanitizeResultEntry(entry) {
     }))
     .filter((e) => e.entity);
   const classifications = ARF_TAXONOMY.classify(raw);
+  const found = needsClassification(fields) ? classifications.length > 0 : !!description;
   return {
     itemId: entry.itemId,
-    status: classifications.length ? "found" : "not_found",
+    status: found ? "found" : "not_found",
     description,
     classifications,
   };
@@ -1021,10 +1078,10 @@ async function processNext(workerIndex) {
     const pending = await findPending(fresh, inFlightIds, project.batchSize || DEFAULT_BATCH_SIZE);
     if (!pending.length) return {};
     claimed = pending;
-    searchUrl = buildSearchUrl(claimed);
+    searchUrl = buildSearchUrl(claimed, fresh.fields);
     while (searchUrl.length > MAX_SEARCH_URL_LEN && claimed.length > 1) {
       claimed = claimed.slice(0, -1);
-      searchUrl = buildSearchUrl(claimed);
+      searchUrl = buildSearchUrl(claimed, fresh.fields);
     }
     const workers = engine.workers.slice();
     workers[workerIndex] = {
@@ -1577,10 +1634,10 @@ async function handleResult(rawMessage, tabId) {
   let anyBlocked = false;
   // Saved before the worker is freed below, so processNext can never see
   // these companies as both "not in flight" and "still pending".
-  const project = await updateItems(engine.activeProjectId, worker.currentItemIds, (byId) => {
+  const project = await updateItems(engine.activeProjectId, worker.currentItemIds, (byId, meta) => {
     for (const raw of rawMessage.results) {
       if (!raw || !claimedIds.has(raw.itemId)) continue; // not part of this worker's claimed batch - ignore
-      const entry = sanitizeResultEntry(raw);
+      const entry = sanitizeResultEntry(raw, meta.fields);
       if (!entry) continue; // malformed/failed re-validation - drop just this entry
       const item = byId.get(entry.itemId);
       if (!item || item.status !== "pending") continue;

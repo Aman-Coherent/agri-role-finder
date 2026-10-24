@@ -256,6 +256,7 @@ function computeRateAndEta(project, pendingCount) {
 
 let selectedProjectId = null;
 let pendingProjectName = null;
+let pendingFields = null; // the ticks at the moment "Create & choose CSV" was clicked
 
 function populateSelect(summaries, engine) {
   const select = document.getElementById("projectSelect");
@@ -323,6 +324,55 @@ async function createProject(name, companies, detected, settings, onProgress) {
 
 let importing = false;
 
+// --- What to find (the project's fields) ---
+
+// The ticks are the choice for the NEXT project while the new-project form is
+// open (or no project is selected); otherwise they show, read-only, what the
+// selected project was created to find. A project's fields never change -
+// see createProjectFromChunks in background.js.
+let newProjectFormOpen = false;
+
+function fieldBoxes() {
+  return Array.from(document.querySelectorAll(".fieldChoice"));
+}
+
+function chosenFields() {
+  return fieldBoxes().filter((b) => b.checked).map((b) => b.value);
+}
+
+function fieldsText(fields) {
+  return ARF_STORE.normalizeFields(fields).map((f) => ARF_STORE.FIELD_LABELS[f]).join(", ");
+}
+
+const NEW_PROJECT_FIELDS_HINT =
+  "Description only asks Google a much shorter question (faster, fewer AI-limit pauses). " +
+  "Entities, roles and business types are always worked out together, so ticking any of " +
+  "them asks the full question - the ticks then choose which columns you download.";
+
+function renderFieldChoices(project) {
+  const showProject = !!project && !newProjectFormOpen;
+  if (showProject) {
+    const fields = ARF_STORE.normalizeFields(project.fields);
+    for (const b of fieldBoxes()) b.checked = fields.includes(b.value);
+  }
+  for (const b of fieldBoxes()) b.disabled = showProject;
+  document.getElementById("fieldsHint").textContent = showProject
+    ? `"${project.name}" finds: ${fieldsText(project.fields)}. Chosen when the project was created - make a new project to find something else.`
+    : NEW_PROJECT_FIELDS_HINT;
+
+  // Downloads follow the selected project's fields.
+  const fields = ARF_STORE.normalizeFields(project && project.fields);
+  const classified = ARF_STORE.needsClassification(fields);
+  document.getElementById("exportOnList").style.display = classified ? "" : "none";
+  document.getElementById("exportNew").style.display = classified ? "" : "none";
+  document.getElementById("exportResults").style.display = classified ? "none" : "";
+  document.getElementById("exportHintText").textContent = !classified
+    ? "results.csv: one row per company with its description."
+    : fields.includes("entities")
+    ? "One row per company + entity."
+    : "One row per company (no entity column, so its roles / business types are merged).";
+}
+
 async function refresh() {
   if (importing) return; // the import's progress line owns the status box
   const { engine, summaries } = await chrome.runtime.sendMessage({ type: "GET_STATE" });
@@ -354,6 +404,7 @@ async function refresh() {
   const settingsHint = document.getElementById("settingsHint");
 
   if (!selectedProjectId) {
+    renderFieldChoices(null);
     document.getElementById("status").textContent = "No project selected.";
     document.getElementById("progressBar").style.display = "none";
     document.getElementById("currentItem").textContent = "";
@@ -370,6 +421,8 @@ async function refresh() {
     refresh();
     return;
   }
+
+  renderFieldChoices(project);
 
   // Keep the fields honest: always reflect the SELECTED project's actual
   // stored settings, not whatever was last typed for a different project.
@@ -406,6 +459,7 @@ async function refresh() {
     `${batchSize} ${batchSize > 1 ? "companies" : "company"} per search)\n` +
     `Pending: ${counts.pending}\nClassified: ${counts.found}\n` +
     `Blocked (needs manual review): ${counts.blocked}\nNot found: ${counts.not_found}` +
+    `\nFinding: ${fieldsText(project.fields)}` +
     (detectedText ? `\n\nColumns used: ${detectedText}` : "");
 
   const progressBar = document.getElementById("progressBar");
@@ -448,6 +502,8 @@ document.getElementById("projectSelect").addEventListener("change", (e) => {
 // popup, which causes the popup to auto-close (popups dismiss on blur)
 // before you can ever type a name. A plain in-page input avoids that.
 document.getElementById("newProjectBtn").addEventListener("click", () => {
+  newProjectFormOpen = true;
+  renderFieldChoices(null);
   document.getElementById("newProjectForm").style.display = "block";
   const input = document.getElementById("newProjectNameInput");
   input.value = "";
@@ -455,7 +511,9 @@ document.getElementById("newProjectBtn").addEventListener("click", () => {
 });
 
 document.getElementById("newProjectCancelBtn").addEventListener("click", () => {
+  newProjectFormOpen = false;
   document.getElementById("newProjectForm").style.display = "none";
+  refresh();
 });
 
 document.getElementById("newProjectNameInput").addEventListener("keydown", (e) => {
@@ -469,7 +527,15 @@ document.getElementById("newProjectConfirmBtn").addEventListener("click", () => 
     input.focus();
     return;
   }
+  if (!chosenFields().length) {
+    alert("Tick at least one thing to find (Description, Entities, Roles or Business type).");
+    return;
+  }
   pendingProjectName = name;
+  pendingFields = chosenFields();
+  // The choice is captured; the form is done even if the file picker is
+  // then cancelled.
+  newProjectFormOpen = false;
   document.getElementById("newProjectForm").style.display = "none";
   document.getElementById("csvFile").click();
 });
@@ -477,7 +543,10 @@ document.getElementById("newProjectConfirmBtn").addEventListener("click", () => 
 document.getElementById("csvFile").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   const name = pendingProjectName;
+  const fields = pendingFields;
   pendingProjectName = null;
+  pendingFields = null;
+  newProjectFormOpen = false;
   e.target.value = ""; // reset so choosing the same file again still fires 'change'
   if (!file || !name) return;
 
@@ -508,7 +577,7 @@ document.getElementById("csvFile").addEventListener("change", async (e) => {
   const batchSize = Number(document.getElementById("batchSize").value) || 3;
   importing = true;
   try {
-    const res = await createProject(name, companies, detected, { delayMinSec, delayMaxSec, concurrency, batchSize }, (done) => {
+    const res = await createProject(name, companies, detected, { delayMinSec, delayMaxSec, concurrency, batchSize, fields }, (done) => {
       status.textContent = `Importing ${done.toLocaleString()} of ${companies.length.toLocaleString()} companies - keep this window open...`;
     });
     if (!res || !res.ok) {
@@ -568,6 +637,13 @@ document.getElementById("resumeBtn").addEventListener("click", async () => {
 // original file on native_id.
 const INPUT_COLUMNS = ["native_id", "company_name", "country", "state", "city", "website"];
 const RESULT_COLUMNS = ["description", "entity", "roles", "business_type"];
+// Which result column each field gives. A project only exports the columns of
+// the fields it was created to find, in this order.
+const FIELD_COLUMN = { description: "description", entities: "entity", roles: "roles", businessType: "business_type" };
+
+function resultColumns(fields) {
+  return ARF_STORE.normalizeFields(fields).map((f) => FIELD_COLUMN[f]);
+}
 
 function inputCells(item) {
   return INPUT_COLUMNS.map((c) => item[c] || "");
@@ -627,22 +703,63 @@ async function forEachItem(project, fn) {
   }
 }
 
+// One company's rows in one of the two results files (which: "onList" |
+// "fresh"), with only the columns of the project's fields.
+//   - Entities ticked: one row per company + entity, exactly as before.
+//   - Entities not ticked: one row per company - with no entity column to tell
+//     two of its entities apart, their roles / business types are merged into
+//     one row. A company with nothing to show in the ticked columns is left
+//     out (e.g. Roles only, and its entity had no roles).
+function classifiedRows(item, which, fields) {
+  const picked = ARF_STORE.normalizeFields(fields);
+  const parts = splitClassifications(item)[which];
+  if (!parts.length) return [];
+  const cells = (part) =>
+    picked.map((f) =>
+      f === "description" ? item.description || ""
+      : f === "entities" ? part.entity
+      : f === "roles" ? rolesCell(part.roles)
+      : businessTypeCell(part.roles)
+    );
+  if (picked.includes("entities")) return parts.map((p) => [...inputCells(item), ...cells(p)]);
+  const seen = new Set();
+  const roles = parts.flatMap((p) => p.roles).filter((r) => {
+    const key = `${r.name}|${r.code}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const row = cells({ entity: "", roles });
+  const hasResult = picked.some((f, i) => f !== "description" && row[i]);
+  return hasResult ? [[...inputCells(item), ...row]] : [];
+}
+
 async function exportClassified(which, filename) {
   const project = await getSelectedProject();
   if (!project) return;
   const rows = [];
   await forEachItem(project, (item) => {
-    if (item.status !== "found") return;
-    for (const part of splitClassifications(item)[which]) {
-      rows.push([...inputCells(item), item.description || "", part.entity, rolesCell(part.roles), businessTypeCell(part.roles)]);
-    }
+    if (item.status === "found") rows.push(...classifiedRows(item, which, project.fields));
   });
-  downloadCsv(filename, toCsv([...INPUT_COLUMNS, ...RESULT_COLUMNS], rows));
+  downloadCsv(filename, toCsv([...INPUT_COLUMNS, ...resultColumns(project.fields)], rows));
+}
+
+// Description-only projects: one file of every company described.
+async function exportDescriptions() {
+  const project = await getSelectedProject();
+  if (!project) return;
+  const rows = [];
+  await forEachItem(project, (item) => {
+    if (item.status === "found") rows.push([...inputCells(item), item.description || ""]);
+  });
+  downloadCsv("results.csv", toCsv([...INPUT_COLUMNS, "description"], rows));
 }
 
 async function exportByStatus(status, filename, withDescription) {
   const project = await getSelectedProject();
   if (!project) return;
+  // Only if the project was asked for descriptions at all.
+  withDescription = withDescription && ARF_STORE.normalizeFields(project.fields).includes("description");
   const rows = [];
   await forEachItem(project, (item) => {
     if (item.status === status) rows.push([...inputCells(item), ...(withDescription ? [item.description || ""] : [])]);
@@ -655,6 +772,8 @@ document.getElementById("exportOnList").addEventListener("click", () =>
 );
 
 document.getElementById("exportNew").addEventListener("click", () => exportClassified("fresh", "new_results.csv"));
+
+document.getElementById("exportResults").addEventListener("click", () => exportDescriptions());
 
 // A not_found row can still carry a description: the AI described the
 // company but put it in no entity at all.

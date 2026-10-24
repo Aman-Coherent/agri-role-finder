@@ -39,7 +39,7 @@ function loadPopup() {
   const ctx = vm.createContext({
     console, URL, Blob: class {}, setInterval: () => 0, alert: () => {},
     chrome: chromeStub(),
-    document: { getElementById: el, createElement: el, activeElement: null },
+    document: { getElementById: el, createElement: el, querySelectorAll: () => [], activeElement: null },
   });
   ctx.globalThis = ctx;
   for (const f of ["taxonomy.js", "store.js"]) vm.runInContext(fs.readFileSync(path.join(ROOT, f), "utf8"), ctx);

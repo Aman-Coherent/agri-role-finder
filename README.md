@@ -47,6 +47,27 @@ long run.
   finishes.** If it gets closed half-way, nothing half-imported is left
   behind: just create the project again.
 
+## What to find
+
+When you create a project, tick what you want: **Description**, **Entities**, **Roles**,
+**Business type** (any one, any two, or all). The choice is fixed for that project; to find
+something else for the same file, create another project.
+
+- **Any choice that includes Entities, Roles or Business type** asks Google exactly the same
+  question as always, word for word, so the results are the same quality. These three are always
+  worked out together (a role belongs to an entity, a business type to a role). Your ticks only
+  choose which columns you download.
+- **Description only** asks a much shorter question (about 1,100 characters instead of 10,000). It
+  leaves out the entity list and the entity/role/business-type parts; every sentence it keeps,
+  including the description instruction itself, is word for word the full question's. Being
+  short, it gets an AI Overview more often and uses less of Google's AI-answer limit.
+
+| Ticked | "Found" means | Download |
+|---|---|---|
+| Description only | a description came back | `results.csv`: one row per company with its description |
+| Includes Entities | at least one entity was found | `on_list_results.csv` / `new_results.csv`: one row per company + entity, ticked columns only |
+| Roles and/or Business type, without Entities | at least one entity was found | same two files, one row per company, its roles / business types merged |
+
 ## How it works, step by step
 
 1. **+ New**: name the project and choose the CSV.

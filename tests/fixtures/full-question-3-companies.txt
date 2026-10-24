@@ -1,0 +1,70 @@
+I will list 3 agriculture-sector companies. For EACH one: if a website is given, use that official website as the main source to identify the company and what it does; if no website is given, identify the company by its name and location.
+
+Companies:
+1) "Sousho Inc." - website: https://www.so-sho.jp/ - location: Osaka, Osaka, Japan
+2) "Logic Inc." - location: Kanazawa, Japan
+3) "B&B Recycling GmbH" - website: https://bb-recycling.de - location: Schönefeld OT Selchow, Germany
+
+For each company:
+(a) Write a factual description of what the company actually does - its main products or services and who it sells to - in 2 to 3 sentences, on ONE line.
+(b) Choose every ENTITY from the list below that the company belongs to, and under each entity every ROLE from that entity's own roles that the company actually performs. Copy entity and role names EXACTLY as written in the list. A company can have several entities and several roles.
+(c) Only if the company clearly does something that no entity or role in the list covers, write your own short, plain name for that entity or role instead.
+(d) After each role, in square brackets, write the business type the company actually is for that role, using ONLY these exact words: Manufacturer, Third Party Manufacturer, Exporter, Importer, Distributor, Wholesaler, Trader, Supplier, Retailer, Service Provider, Brand, Formulator, CRO. Pick the specific one - for example Exporter, not Exporter/Importer; Distributor, not Distributor/Wholesaler. If it is more than one, separate them with commas inside the brackets.
+
+Reply in exactly this format and nothing else - no greeting, no explanation, no markdown, no tables:
+COMPANY <number>
+DESCRIPTION: <2-3 sentences on one line>
+ENTITY: <entity name> | ROLES: <role> [<business type>]; <role> [<business type>]
+Write one ENTITY line for each entity the company belongs to. Use the same company numbers as above, keep the same order, and do not skip any company. After the last company, write one final line: END OF ANSWERS
+If you cannot find reliable information about a company, write DESCRIPTION: NONE and ENTITY: NONE for it instead of guessing - never invent what a company does.
+
+LIST - each line is an entity, a colon, then that entity's roles separated by semicolons:
+Seeds & biologicals: Seed Company / Seed Producer; Seed Production Organiser; Seed Importer / Exporter; Seed Distributor; Biologicals Manufacturer, i.e. biofertilizer/biopesticide; Biologicals Formulator / R&D
+Fertilizers: Fertilizer Manufacturer; Fertilizer Contract / Toll Manufacturer; Fertilizer Importer / Exporter; Fertilizer Distributor / Wholesaler; Fertilizer Dealer / Retailer; Fertilizer Brand Owner / Marketer; Specialty Fertilizer Formulator
+Crop protection: Agrochemical Technical Manufacturer; Agrochemical Formulation Manufacturer; Agrochemical Contract / Toll Manufacturer; Agrochemical Importer / Exporter; Pesticide Distributor; Pesticide Retailer; Agrochemical Brand Marketer; Formulation Developer / Registration CRO
+Coco peat / substrate: Coco Peat / Substrate Manufacturer; Private-label Substrate Manufacturer; Coco Peat Exporter / Importer; Growing Media Distributor; Potting Mix / Garden Retailer; Growing Media Brand
+Agri inputs & solutions: Integrated Agri-input Company; Agri-input Contract Manufacturer; Agri-input Importer / Exporter; Multi-brand Agri-input Distributor; Agri-input Retail Chain / Krishi Kendra; Agronomy / Crop Advisory Service; Agri-input Brand; Agri-input Formulator
+Innovative agri solutions: Innovative Agri-product Manufacturer; Agri-innovation Importer / Distributor; Agri Solution Integrator; Agri-innovation Brand
+Livestock nutrition & vet: Feed Additive / Premix Manufacturer; Veterinary Medicine & Vaccine Manufacturer; Animal Health Contract Manufacturer; Animal Health Importer / Exporter; Veterinary Product Distributor; Veterinary Medical Store; Animal Health Marketing Company; Veterinary Formulation Developer
+Aquaculture input & tech: Aqua Feed Manufacturer; Aquaculture Equipment Manufacturer; Aqua Contract Manufacturer; Aqua Input Importer / Exporter; Aqua Input Distributor; Aqua Shop / Retailer; Aquaculture Technical Service; Aqua Brand
+GH/CEA consortium: Turnkey CEA Project Consortium; CEA Export Alliance
+GH sustainability consulting: Greenhouse Design & Engineering Consultant; Greenhouse Energy & Sustainability Consultant
+GH construction & hydroponics: Greenhouse / Polyhouse Manufacturer; Hydroponic System Manufacturer; Greenhouse Component Fabricator; Greenhouse Importer / Exporter; Hydroponics Distributor; Hydroponics / Grow Shop; Greenhouse Turnkey Contractor; Greenhouse Brand
+Vertical racking: Vertical Farm Rack Manufacturer; Racking Contract Fabricator; Racking Importer / Exporter; Racking Distributor; Vertical Farm Installer; Racking Brand
+Liquid storage: Agri Storage Tank Manufacturer; Tank Contract Fabricator; Tank Importer / Exporter; Tank Distributor; Tank Retailer; Storage Installation Service; Tank Brand
+Plastics: Greenhouse / Mulch Film Manufacturer; Agri Pipe & Fittings Manufacturer; Agri Plastics Contract Manufacturer; Agri Plastics Importer / Exporter; Agri Plastics Distributor; Agri Plastics Retailer; Agri Plastics Brand
+Farm machinery: Tractor & Farm Machinery OEM; Farm Implement Manufacturer; Machinery Component Manufacturer; Machinery Importer / Exporter; Regional Machinery Distributor; Authorised Tractor / Machinery Dealer; Custom Hiring / Machinery Rental Service; Machinery Brand
+Irrigation: Micro-irrigation (Drip/Sprinkler) Manufacturer; Irrigation Component Contract Manufacturer; Irrigation Importer / Exporter; Irrigation Distributor; Irrigation Dealer; Irrigation Installer / Turnkey Contractor; Irrigation Brand
+Tech / digital: Farm Management Software (SaaS) Provider; Agri Marketplace / E-commerce Platform; Traceability Software Provider
+Agri-tech, IoT, drones, robotics: Agri Drone Manufacturer; Drone Spraying Service Provider; IoT Sensor / Farm Device Manufacturer; Agri Robotics Developer
+Strategy & CEA advisory: Agri Strategy Consultant; CEA Feasibility & Technical Advisor
+Market intelligence: Agri Market Research Firm; Commodity Price & Data Provider
+Sustainability platform: Agri Carbon Credit Program Developer; ESG / Impact Program Operator
+Sustainable & regenerative: Regenerative / Organic Input Manufacturer; Organic Input Importer / Exporter; Organic Input Distributor; Organic Input Retailer; Regenerative Farming Advisory; Organic Input Brand
+Agri input / equipment manufacturer: Agri-input Manufacturer; Agri Equipment Manufacturer; Agri Contract Manufacturer; Manufacturer-Exporter; Agri Brand
+Agri input / equipment distributor: Agri-input Distributor / Wholesaler; Agri Equipment Distributor; Agri-input Importer; Own-label Distributor
+Regional trading: Regional Agri-input Trader; Mandi Commission Agent / Commodity Trader; Rural Agri Retail Outlet
+Dealers, distributors & importers: Authorised Dealer; Stockist / Wholesaler; Agri Importer
+Exporters & trading: Merchant Exporter; Manufacturer-Exporter; Agri Commodity Importer; Trading House; Own-label Export Brand
+Supply chain & logistics: Cold Storage Operator; Agri Warehousing Provider; Agri Transport & Cold-chain Logistics; Agri Freight Forwarder / Customs Broker; Produce Aggregator / Procurement Agent
+Large-scale farm / agribusiness: Large Commercial Farm; Integrated Agribusiness, farm + processing; Farm Produce Exporter; Produce Aggregator / Wholesaler; Farm-to-consumer Retail; Farm Produce Brand
+GH/CEA operators: Greenhouse Produce Grower; Greenhouse Produce Exporter; Wholesale Supplier to Retail Chains; Farm-direct / D2C Seller; Branded Greenhouse Produce
+Urban / vertical: Vertical Farm Operator; Microgreens / D2C Seller; HoReCa Supplier; Branded Urban Produce
+Nurseries & landscaping: Nursery / Plant Propagator; Tissue Culture Lab; Plant & Sapling Exporter; Wholesale Nursery; Retail Nursery / Garden Centre; Landscaping Contractor
+Organic / regenerative: Certified Organic Grower; Organic Produce Exporter; Organic Produce Aggregator; Organic Store / D2C; Organic Food Brand
+Renewable energy adopters: Agrivoltaic (Solar) Farm; Biogas / Bio-CNG Plant Operator
+Alt protein & circular: Plant-based Protein Manufacturer; Insect Protein Producer; Agri-waste-to-value Processor; Food Co-packer; Alt-protein Importer / Exporter; Alt-protein Distributor; Alt-protein Brand; Food-tech R&D / Formulator
+Crop farming: Crop Farmer / Grower; Farmer Producer Organisation, FPO; Produce Exporter; Produce Aggregator / Trader
+Livestock farms: Dairy Farm; Cattle / Sheep Farm; Dairy Processor; Livestock / Meat Exporter; Milk Collection & Distribution; Farm-fresh Milk D2C; Dairy Brand
+Poultry: Broiler Farm; Layer / Egg Farm; Hatchery; Poultry Integrator / Processor; Egg & Poultry Exporter; Egg & Chicken Distributor; Chicken Retail Outlet; Poultry Brand
+Vet hospitals: Veterinary Hospital / Clinic; Mobile Veterinary Service
+Feed mill: Compound Feed Manufacturer; Toll Feed Miller; Feed Importer / Exporter; Feed Distributor; Feed Dealer / Retailer; Feed Brand; Feed Formulation Nutritionist
+Fish & shrimp farms: Fish / Shrimp Farm; Shrimp / Fish Hatchery; Seafood Processor; Seafood Exporter; Fish Wholesaler; Fish Retail Outlet; Seafood Brand
+Aquaponics & RAS: RAS Fish Farm; Aquaponics Farm; Farm-direct Seller; RAS Produce Brand
+Aqua products & services: Aqua Product Manufacturer; Aqua Importer / Exporter; Aqua Distributor; Aqua Shop; Aqua Lab & Technical Service; Aqua Brand
+Agri & food security authorities: National Agriculture Ministry / Agency
+Regional development authorities: State / District Agriculture Department
+Water & irrigation authorities: Irrigation Department / Water Board
+Investors & VCs: Agri Venture Capital; Agri Private Equity; Agri Incubator / Angel Network
+Banks & DFIs: Agri Lending Bank; Development Finance Institution; Agri NBFC / Microfinance
+Certification & labs: Organic / Quality Certification Body; Soil, Seed & Residue Testing Lab; Standards Organisation; Field Trial CRO

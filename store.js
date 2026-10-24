@@ -94,8 +94,27 @@ const ARF_STORE = (() => {
     return chunks;
   }
 
+  // What a project can ask for, chosen when it is created (see buildPrompt in
+  // background.js). Entities, roles and business types are always worked out
+  // together - a role belongs to an entity, a business type to a role - so any
+  // of them needs the full question; Description alone needs a shorter one.
+  const ALL_FIELDS = ["description", "entities", "roles", "businessType"];
+  const FIELD_LABELS = { description: "Description", entities: "Entities", roles: "Roles", businessType: "Business type" };
+
+  // Known fields only, in a fixed order; nothing (or nothing valid) means
+  // everything - which is also what projects made before this choice existed
+  // were asked.
+  function normalizeFields(fields) {
+    const picked = Array.isArray(fields) ? ALL_FIELDS.filter((f) => fields.includes(f)) : [];
+    return picked.length ? picked : ALL_FIELDS.slice();
+  }
+
+  function needsClassification(fields) {
+    return normalizeFields(fields).some((f) => f !== "description");
+  }
+
   return {
-    CHUNK_SIZE, STATUSES, PROJECT_ID_RE,
+    CHUNK_SIZE, STATUSES, PROJECT_ID_RE, ALL_FIELDS, FIELD_LABELS, normalizeFields, needsClassification,
     metaKey, chunkKey, newProjectId, chunkOfId,
     emptyCounts, countsOfItems, sumCounts, leanItem, buildChunks,
   };
